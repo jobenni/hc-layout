@@ -83,7 +83,14 @@ function readableTextOn(hexColor) {
 }
 
 const initialsOf = (login) => login.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
-const openUrl = (url) => { if (url) exec("open", [url]); };
+// The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
+// xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
+const OPEN_ON_LINUX = 'if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then command -v wslview >/dev/null 2>&1 && exec wslview "$1"; exec explorer.exe "$1"; fi; exec xdg-open "$1"';
+const openUrl = (url, cx) => {
+  if (!url) return;
+  if (window()?.platform === "linux") exec("sh", ["-c", OPEN_ON_LINUX, "sh", url]);
+  else cx.open_url(url);
+};
 
 export default class GhIssues extends View {
   init(_props, cx) {
@@ -327,7 +334,7 @@ export default class GhIssues extends View {
           ? this.actionButton(`open-session-${issue.number}`, "Ouvrir la session", t, true, () => this.openSession(session))
           : this.actionButton(`launch-${issue.number}`, isLaunching ? "Création du worktree…" : "Lancer Claude", t, !isLaunching,
             (cx) => { if (!isLaunching) this.launch(issue, cx); }))
-        .child(this.actionButton(`github-${issue.number}`, "Voir sur GitHub", t, false, () => openUrl(issue.url))))
+        .child(this.actionButton(`github-${issue.number}`, "Voir sur GitHub", t, false, (cx) => openUrl(issue.url, cx))))
       .when(Boolean(session), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(session.branch)))
       .when(Boolean(pr), (el) => el.child(this.pullRequestBlock(pr, t, `issue-${issue.number}`)))
       .when(Boolean(session) && !pr, (el) => el.child(div().text_size(11).text_color(t.dim).child("Pas encore de PR pour cette branche")));
@@ -338,7 +345,7 @@ export default class GhIssues extends View {
     const look = pullRequestLook(pr, t);
     const stateLabel = pr.isDraft && pr.state === "OPEN" ? "brouillon" : PR_STATE_LABEL[pr.state] ?? pr.state.toLowerCase();
     return v_flex().gap(4)
-      .child(h_flex().id(`pr-${scope}-${pr.number}`).gap(6).items_center().cursor_pointer().on_click(() => openUrl(pr.url))
+      .child(h_flex().id(`pr-${scope}-${pr.number}`).gap(6).items_center().cursor_pointer().on_click((_e, cx) => openUrl(pr.url, cx))
         .child(svg(look.icon).size(14).flex_none().text_color(look.color))
         .child(div().flex_none().text_size(11).text_color(t.accent).child(`#${pr.number}`))
         .child(div().flex_1().min_w(0).truncate().child(pr.title))
@@ -346,7 +353,7 @@ export default class GhIssues extends View {
       .when(!steps.length, (el) => el.child(div().text_size(11).text_color(t.dim).child("Aucun check")))
       .children(steps.map((step, index) =>
         h_flex().id(`check-${scope}-${pr.number}-${index}`).h(22).px(4).gap(6).items_center().rounded(5).cursor_pointer()
-          .hover((s) => s.bg(t.hover)).on_click(() => openUrl(step.url))
+          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => openUrl(step.url, cx))
           .child(step.outcome === "pending"
             ? div().w(12).flex_none().text_color(t.working).frames(["◐", "◓", "◑", "◒"], 160)
             : div().w(12).flex_none().text_color(this.outcomeColor(step.outcome, t)).child(OUTCOME_GLYPH[step.outcome]))

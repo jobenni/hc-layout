@@ -19,6 +19,15 @@ function find(node, id) {
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
+// The rail's way back. workspace-chrome hides its toggle on the macOS rail and leaves it to the
+// agents list, which this layout doesn't have; same widths and memory as the shipped toggle.
+function toggleSidebar() {
+  const width = find(layout(), "sidebar")?.size?.px;
+  if (!narrow()) setShared("sidebar.width", width);
+  setShared("sidebar.collapsed", !narrow());
+  run("layout.resize", { id: "sidebar", px: narrow() ? (shared("sidebar.width") ?? 268) : window()?.platform === "macos" ? 76 : 44 });
+}
+
 // Where a space is now: its first terminal's live folder, else where it was made.
 // `ps`: panes(), read once by the caller (each read copies every pane).
 function place(s, ps) {
@@ -27,6 +36,8 @@ function place(s, ps) {
 }
 const rowHeight = ({ tree }) => (tree ? 28 : 30);
 const RAIL_CELL = 32;
+const RAIL_SESSION_CELL = 32;
+const RAIL_SESSION_AVATAR = 18;
 // Session rows line up with the space row above: icon under its avatar column, name under its name.
 const SESSION_ICON = 14;
 const SESSION_GAP = 8;
@@ -57,7 +68,14 @@ const RESTING_STATUSES = ["done", "idle"];
 const RESTING_CARD_TTL = 86400000;
 // gh answers as the folder's account only through its mise env (GH_TOKEN).
 const GH_WITH_FOLDER_ENV = 'command -v mise >/dev/null 2>&1 && exec mise exec -- gh "$@"; exec gh "$@"';
-const openUrl = (url) => { if (url) exec("open", [url]); };
+// The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
+// xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
+const OPEN_ON_LINUX = 'if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then command -v wslview >/dev/null 2>&1 && exec wslview "$1"; exec explorer.exe "$1"; fi; exec xdg-open "$1"';
+const openUrl = (url, cx) => {
+  if (!url) return;
+  if (window()?.platform === "linux") exec("sh", ["-c", OPEN_ON_LINUX, "sh", url]);
+  else cx.open_url(url);
+};
 // Changes made outside Herdr (an editor's save, a commit in another app): looked
 // for this often, in repos the list shows, while the window is in front.
 const FALLBACK = 60000;
@@ -492,7 +510,7 @@ export default class Spaces extends View {
       .when(Boolean(reason) && reason !== a.sessionName, (el) => el.child(div().pl(detailIndent).truncate().text_size(11.5).text_color(tint).child(reason)))
       .when(Boolean(issue), (el) => el.child(h_flex().id(`card-issue-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
         .when(Boolean(ticket?.url), (row) => row.tooltip("Ouvrir le ticket sur GitHub")
-          .on_click((_e, cx) => { cx.stop_propagation(); openUrl(ticket.url); }))
+          .on_click((_e, cx) => { cx.stop_propagation(); openUrl(ticket.url, cx); }))
         .child(svg("mods/gh-issues/icons/issue.svg").size(12).flex_none().text_color(t.ansi2))
         .child(div().flex_none().font_semibold().text_color(t.ansi2).child(`#${issue}`))
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(ticket?.title ?? ""))))
@@ -502,6 +520,37 @@ export default class Spaces extends View {
         .when(Boolean(shownBranch) && shownBranch !== a.space_name, (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(shownBranch)))
         .when(!shownBranch || shownBranch === a.space_name, (el) => el.child(div().flex_1()))
         .when(Boolean(g?.linked), (el) => el.child(div().flex_none().px(4).h(14).rounded(3).border_1().border_color(t.dim + "66").text_size(10).text_color(t.muted).flex().items_center().child("worktree"))));
+  }
+
+  // On the rail a card shrinks to its space's avatar with the status mark on its corner; the tooltip says the rest.
+  railSessionCell(a, section, t) {
+    const since = this.changed[a.address]?.at;
+    const tint = tone(t, a.status);
+    const label = [section, a.sessionName, a.space_name, since ? elapsed(Date.now() - since) : null].filter(Boolean).join(" · ");
+    return railCell(div()
+      .id(`rail-card-${a.address}`)
+      .relative()
+      .size(RAIL_SESSION_CELL)
+      .flex()
+      .items_center()
+      .justify_center()
+      .rounded(8)
+      .bg(tint + (a.focused ? "26" : "0d"))
+      .cursor_pointer()
+      .hover((s) => s.bg(tint + "1c"))
+      .tooltip(label)
+      .on_click(() => run("pane.focus", { pane: a.pane }))
+      .child(this.spaceMark(a.space, a.space_name, RAIL_SESSION_AVATAR))
+      .child(div().absolute().right(0).bottom(0).rounded(5).bg(t.chrome).p(1).child(this.agentStatus(t, a.status))));
+  }
+
+  // Every carded session, most urgent first, as rail cells above the space numbers.
+  railSessions(sections, t) {
+    const cells = sections.flatMap(([section, list]) => list.map((a) => this.railSessionCell(a, section, t)));
+    if (cells.length === 0) return null;
+    return v_flex().flex_none().pt(6)
+      .child(v_flex().id("rail-sessions").max_h(320).gap(6).items_center().overflow_y_scrollbar().children(cells))
+      .child(div().mx(10).mt(8).h(1).bg(t.border));
   }
 
   // A list of session cards above the spaces, under its title and count.
@@ -950,14 +999,16 @@ export default class Spaces extends View {
       this.revealedAt = this.activeAt;
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
-    const blocked = collapsed ? [] : this.agentsWithStatus("blocked");
-    const working = collapsed ? [] : this.agentsWithStatus("working");
+    const blocked = this.agentsWithStatus("blocked");
+    const working = this.agentsWithStatus("working");
     const now = Date.now();
-    const resting = collapsed ? [] : this.agentsWithStatus(...RESTING_STATUSES).filter((a) => this.restedRecently(a, now));
+    const resting = this.agentsWithStatus(...RESTING_STATUSES).filter((a) => this.restedRecently(a, now));
+    const railSessions = collapsed ? this.railSessions([["Needs you", blocked], ["En cours", working], ["Au repos", resting]], t) : null;
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
-      .when(blocked.length > 0, (el) => el.child(this.cardSection("needs-you", "Needs you", t.blocked, blocked, 260, t)))
-      .when(working.length > 0, (el) => el.child(this.cardSection("working", "En cours", t.working, working, 300, t)))
-      .when(resting.length > 0, (el) => el.child(this.cardSection("resting", "Au repos", t.idle ?? t.dim, resting, 260, t)))
+      .when(Boolean(railSessions), (el) => el.child(railSessions))
+      .when(!collapsed && blocked.length > 0, (el) => el.child(this.cardSection("needs-you", "Needs you", t.blocked, blocked, 260, t)))
+      .when(!collapsed && working.length > 0, (el) => el.child(this.cardSection("working", "En cours", t.working, working, 300, t)))
+      .when(!collapsed && resting.length > 0, (el) => el.child(this.cardSection("resting", "Au repos", t.idle ?? t.dim, resting, 260, t)))
       .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child(div().flex_1().child("Spaces")))
@@ -971,6 +1022,10 @@ export default class Spaces extends View {
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
         .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-        .children(list));
+        .children(list))
+      .when(collapsed, el => el.child(h_flex().h(44).flex_none().items_center().justify_center()
+        .child(div().id("sidebar-unfold").size(32).flex().items_center().justify_center().rounded(6)
+          .text_size(24).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip("Déplier la barre latérale").on_click(toggleSidebar).child("»"))));
   }
 }
