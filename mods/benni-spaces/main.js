@@ -5,7 +5,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -66,8 +66,74 @@ const CARDED_STATUSES = ["blocked", "working"];
 // Sessions at rest stay carded this long after their last change.
 const RESTING_STATUSES = ["done", "idle"];
 const RESTING_CARD_TTL = 86400000;
-// gh answers as the folder's account only through its mise env (GH_TOKEN).
-const GH_WITH_FOLDER_ENV = 'command -v mise >/dev/null 2>&1 && exec mise exec -- gh "$@"; exec gh "$@"';
+// gh (and git pushing through gh's credentials) answers as the folder's account only through its mise env (GH_TOKEN).
+const WITH_FOLDER_ENV = 'command -v mise >/dev/null 2>&1 && exec mise exec -- "$@"; exec "$@"';
+
+async function runWithFolderEnv(argv, cwd, on, timeout = 60000) {
+  const r = await exec("sh", ["-c", WITH_FOLDER_ENV, "sh", ...argv], { cwd, on, timeout });
+  if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().split("\n").pop() || `${argv[0]} a échoué`);
+  return r.stdout;
+}
+
+async function runGit(args, cwd, on) {
+  const r = await exec("git", args, { cwd, on, timeout: 60000 });
+  return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr || r.stdout || "").trim().split("\n").pop() };
+}
+
+// A carded session's pull request, from the issue branch to the merge: shown on its card, with
+// the next step as a button (open the PR, hand the failing CI to the agent, clean up once merged).
+const PR_TTL = 30000;
+const PR_TTL_IN_BACKGROUND = 120000;
+const PR_FIELDS = "number,title,url,state,isDraft,headRefOid,statusCheckRollup";
+const TRUNK_BRANCHES = new Set(["main", "master", "(detached)"]);
+// On these, work goes straight to the remote: commit and push instead of a PR.
+const PUSHED_DIRECTLY_BRANCHES = new Set(["main", "master"]);
+// A step's state lives with the PR on a branch of its own, else with the session's folder.
+const stepKey = (session) => session.prKey ?? session.key;
+const FAILED_CHECK_VERDICTS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
+const PENDING_CHECK_VERDICTS = new Set(["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"]);
+const CI_LOG_LINES_PER_RUN = 80;
+const CLEAN_CONFIRM_MS = 4000;
+const SPACE_CLOSE_WAIT = 10000;
+const ICONS = "mods/gh-issues/icons";
+
+function failedChecksOf(pr) {
+  return (pr?.statusCheckRollup ?? []).flatMap((check) => {
+    const isStatusContext = check.__typename === "StatusContext";
+    const verdict = isStatusContext ? check.state : check.status === "COMPLETED" ? check.conclusion : check.status;
+    if (!FAILED_CHECK_VERDICTS.has(verdict)) return [];
+    return [{ name: isStatusContext ? check.context : check.workflowName ? `${check.workflowName} · ${check.name}` : check.name, url: isStatusContext ? check.targetUrl : check.detailsUrl }];
+  });
+}
+
+function checksOutcome(pr) {
+  const checks = pr?.statusCheckRollup ?? [];
+  if (!checks.length) return "none";
+  if (failedChecksOf(pr).length) return "failure";
+  const isPending = (check) => {
+    const verdict = check.__typename === "StatusContext" ? check.state : check.status === "COMPLETED" ? check.conclusion : check.status;
+    return !verdict || PENDING_CHECK_VERDICTS.has(verdict);
+  };
+  return checks.some(isPending) ? "pending" : "success";
+}
+
+function pullRequestLook(pr, t) {
+  if (pr.state === "MERGED") return { icon: `${ICONS}/pr-merged.svg`, color: t.ansi5, label: "fusionnée" };
+  if (pr.state === "CLOSED") return { icon: `${ICONS}/pr-closed.svg`, color: t.ansi1, label: "fermée" };
+  if (pr.isDraft) return { icon: `${ICONS}/pr-draft.svg`, color: t.dim, label: "brouillon" };
+  return { icon: `${ICONS}/pr-open.svg`, color: t.ansi2, label: "ouverte" };
+}
+
+const CHECKS_LOOK = {
+  success: { glyph: "✓", label: "CI ok", tone: "ansi2" },
+  failure: { glyph: "✗", label: "CI en échec", tone: "ansi1" },
+  pending: { glyph: "●", label: "CI en cours", tone: "working" },
+};
+
+// "build\tRun tests\t2026-11-25T10:00:00.1234567Z error: ..." -> "error: ..."
+const ciLogText = (line) => line.split("\t").slice(2).join("\t").replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, "").replace(/\x1b\[[0-9;]*m/g, "");
+const actionsRunIds = (checks) => [...new Set(checks.map((c) => /\/actions\/runs\/(\d+)/.exec(c.url ?? "")?.[1]).filter(Boolean))];
+const isInside = (folder, root) => Boolean(folder) && (folder === root || folder.startsWith(`${root}/`));
 // The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
 // xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
 const OPEN_ON_LINUX = 'if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then command -v wslview >/dev/null 2>&1 && exec wslview "$1"; exec explorer.exe "$1"; fi; exec xdg-open "$1"';
@@ -199,6 +265,8 @@ export default class Spaces extends View {
     this.botChecked = {}; // where() -> when bot.json was last looked for
     this.issues = {}; // where() + "#" + number -> { title, url }, or null when gh couldn't say
     this.sessionGit = {}; // [machine, folder] of a working session -> { name, branch, linked, at }
+    this.pullRequests = {}; // pullRequestKey() -> { pr: the branch's PR or null, at, loading }
+    this.lifecycle = {}; // pullRequestKey() -> { busy: the running step's label, error, sentForHead, confirmCleanUntil }
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
@@ -538,18 +606,21 @@ export default class Spaces extends View {
     const g = key ? this.sessionGit[key] ?? this.git[key] ?? null : null;
     const branch = g?.branch ?? pane?.branch ?? null;
     const issue = issueNumber(branch, a.tab_name, sessionName(a));
-    return { machine, cwd, key, g, branch, issue, issueKey: key && issue ? `${key}#${issue}` : null };
+    return { machine, cwd, key, g, branch, issue, issueKey: key && issue ? `${key}#${issue}` : null, prKey: this.pullRequestKey(machine, key) };
   }
 
   // A carded session's own folder (often a worktree its space doesn't point at): its git, then its ticket.
   lookAtCardedSessions(now, sp, ps, cx) {
     const carded = agents().filter((a) => CARDED_STATUSES.includes(a.status) || this.restedRecently(a, now));
     const keys = new Set();
+    const prKeys = new Set();
     for (const a of carded) {
       const { machine, cwd, key, issue, issueKey } = this.sessionPlace(a, sp, ps);
       if (!key) continue;
       keys.add(key);
-      if (now - (this.sessionGit[key]?.at ?? 0) > SESSION_GIT_TTL) {
+      // Also as soon as the agent changed status: a turn that ends may have committed or pushed.
+      const lastLook = this.sessionGit[key]?.at ?? 0;
+      if (now - lastLook > SESSION_GIT_TTL || (this.changed[a.address]?.at ?? 0) > lastLook) {
         this.sessionGit[key] = { ...this.sessionGit[key], at: now };
         cx.spawn(async (cx) => {
           const r = await exec("git", ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD"], { cwd, on: machine });
@@ -557,21 +628,190 @@ export default class Spaces extends View {
           const [top, common, branch] = r.stdout.trim().split("\n");
           const name = common.endsWith("/.git") ? base(common.slice(0, -5)) : base(common).replace(/\.git$/, "");
           const main = common.endsWith("/.git") ? common.slice(0, -5) : top;
-          this.sessionGit[key] = { name, main, branch: branch === "HEAD" ? "(detached)" : branch, linked: common !== `${top}/.git`, at: now };
+          const unmerged = await exec("git", ["rev-list", "--count", "origin/HEAD..HEAD"], { cwd, on: machine });
+          const commitsAhead = unmerged.code === 0 ? Number(unmerged.stdout.trim()) : 0;
+          const local = PUSHED_DIRECTLY_BRANCHES.has(branch) ? await this.readLocalWork(cwd, machine) : { uncommitted: 0, unpushed: 0 };
+          this.sessionGit[key] = { name, main, top, branch: branch === "HEAD" ? "(detached)" : branch, linked: common !== `${top}/.git`, commitsAhead, ...local, at: Date.now() };
           cx.notify();
         });
+      }
+      const prKey = this.pullRequestKey(machine, key);
+      if (prKey) {
+        prKeys.add(prKey);
+        this.lookAtPullRequest(prKey, a, now, cx);
       }
       // From the main checkout: a worktree elsewhere (~/.orca, ~/.herdr) misses the folder's mise env, so gh would ask as another account.
       const main = this.sessionGit[key]?.main;
       if (!issueKey || !main || issueKey in this.issues) continue;
       this.issues[issueKey] = null;
       cx.spawn(async (cx) => {
-        const r = await exec("sh", ["-c", GH_WITH_FOLDER_ENV, "gh", "api", `repos/{owner}/{repo}/issues/${issue}`, "--jq", "{title, url: .html_url}"], { cwd: main, on: machine, timeout: 30000 });
+        const r = await exec("sh", ["-c", WITH_FOLDER_ENV, "sh", "gh", "api", `repos/{owner}/{repo}/issues/${issue}`, "--jq", "{title, url: .html_url}"], { cwd: main, on: machine, timeout: 30000 });
         try { if (r.code === 0) this.issues[issueKey] = JSON.parse(r.stdout); } catch {}
         cx.notify();
       });
     }
     for (const k of Object.keys(this.sessionGit)) if (!keys.has(k)) delete this.sessionGit[k];
+    for (const k of Object.keys(this.pullRequests)) if (!prKeys.has(k)) delete this.pullRequests[k];
+  }
+
+  // [machine, main checkout, branch] of a session on a branch of its own, once its git is read.
+  pullRequestKey(machine, sessionKey) {
+    const sg = sessionKey ? this.sessionGit[sessionKey] : null;
+    if (!sg?.main || !sg.branch || TRUNK_BRANCHES.has(sg.branch)) return null;
+    return JSON.stringify([machine, sg.main, sg.branch]);
+  }
+
+  lookAtPullRequest(prKey, a, now, cx) {
+    const known = this.pullRequests[prKey];
+    const ttl = window().active ? PR_TTL : PR_TTL_IN_BACKGROUND;
+    if (known?.loading || now - (known?.at ?? 0) < ttl) return;
+    this.pullRequests[prKey] = { ...known, loading: true };
+    cx.spawn(async (cx) => this.readPullRequest(prKey, a, cx));
+  }
+
+  async readPullRequest(prKey, a, cx) {
+    const [machine, main, branch] = JSON.parse(prKey);
+    const before = this.pullRequests[prKey];
+    try {
+      const json = await runWithFolderEnv(["gh", "pr", "list", "--state", "all", "--head", branch, "--limit", "1", "--json", PR_FIELDS], main, machine, 30000);
+      const pr = JSON.parse(json)[0] ?? null;
+      this.pullRequests[prKey] = { ...before, pr, answered: true, at: Date.now(), loading: false };
+      if (before?.at && a) this.announcePullRequestChange(before.pr, pr, a);
+    } catch {
+      this.pullRequests[prKey] = { ...before, at: Date.now(), loading: false };
+    }
+    cx.notify();
+  }
+
+  // Only a change seen while running: a CI that just failed, a PR that just merged.
+  announcePullRequestChange(was, pr, a) {
+    if (!pr) return;
+    const focus = { name: "pane.focus", args: { pane: a.pane } };
+    if (pr.state === "MERGED" && was?.state !== "MERGED") {
+      notify({ title: `PR #${pr.number} fusionnée`, body: `${pr.title}\n« Nettoyer » sur la carte de ${a.space_name} retire son worktree et sa branche.`, level: "success", action: focus });
+    } else if (pr.state === "OPEN" && checksOutcome(pr) === "failure" && checksOutcome(was) !== "failure") {
+      notify({ title: `CI en échec sur #${pr.number}`, body: `${pr.title}\n« Corriger la CI » sur la carte l'envoie à l'agent.`, level: "error", action: focus });
+    }
+  }
+
+  setLifecycle(prKey, change, cx) {
+    this.lifecycle[prKey] = { ...this.lifecycle[prKey], ...change };
+    cx.notify();
+  }
+
+  runLifecycleStep(prKey, busyLabel, step, cx) {
+    if (this.lifecycle[prKey]?.busy) return;
+    this.setLifecycle(prKey, { busy: busyLabel, error: null }, cx);
+    cx.spawn(async (cx) => {
+      try { await step(cx); }
+      catch (error) { this.setLifecycle(prKey, { error: String(error?.message ?? error) }, cx); }
+      finally { this.setLifecycle(prKey, { busy: null }, cx); }
+    });
+  }
+
+  // Files changed and commits not on the upstream, for a session on main or master.
+  async readLocalWork(cwd, machine) {
+    const [status, upstream] = await both(
+      exec("git", ["--no-optional-locks", "status", "--porcelain"], { cwd, on: machine }),
+      exec("git", ["rev-list", "--count", "@{upstream}..HEAD"], { cwd, on: machine }),
+    );
+    return {
+      uncommitted: status.code === 0 ? status.stdout.split("\n").filter(Boolean).length : 0,
+      unpushed: upstream.code === 0 ? Number(upstream.stdout.trim()) : 0,
+    };
+  }
+
+  // The agent knows what it changed, so it writes the commit message; the card waits for its next git read.
+  askCommitAndPush(a, session, branch, cx) {
+    this.runLifecycleStep(stepKey(session), "Envoi…", async (cx) => {
+      const message = `Commite tous les changements en cours (des commits cohérents, avec des messages clairs), puis pousse sur ${branch}.`;
+      const r = await hc(["send", a.address, message]);
+      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "envoi à l'agent impossible");
+      this.setLifecycle(stepKey(session), { commitAskedAt: Date.now() }, cx);
+    }, cx);
+  }
+
+  pushTrunk(session, cx) {
+    this.runLifecycleStep(stepKey(session), "Push…", async (cx) => {
+      await runWithFolderEnv(["git", "push"], session.cwd, session.machine);
+      this.sessionGit[session.key] = { ...this.sessionGit[session.key], unpushed: 0, at: 0 };
+      cx.notify();
+    }, cx);
+  }
+
+  // Pushes the branch and opens its PR: the ticket's title (else the last commit's), "Closes #N", the commits.
+  openPullRequest(prKey, session, ticket, cx) {
+    const [machine, main, branch] = JSON.parse(prKey);
+    this.runLifecycleStep(prKey, "Ouverture…", async (cx) => {
+      await runWithFolderEnv(["git", "push", "-u", "origin", branch], main, machine);
+      const lastSubject = (await runGit(["log", "-1", "--format=%s", branch], main, machine)).out;
+      const commits = (await runGit(["log", "--reverse", "--format=- %s", `origin/HEAD..${branch}`], main, machine)).out;
+      const title = ticket?.title || lastSubject || branch;
+      const body = [session.issue ? `Closes #${session.issue}` : null, commits].filter(Boolean).join("\n\n");
+      await runWithFolderEnv(["gh", "pr", "create", "--head", branch, "--title", title, "--body", body], main, machine);
+      await this.readPullRequest(prKey, null, cx);
+    }, cx);
+  }
+
+  // Hands the failing jobs' logs to the agent, as if typed in its prompt.
+  sendFailingCi(prKey, a, pr, cx) {
+    const [machine, main] = JSON.parse(prKey);
+    this.runLifecycleStep(prKey, "Lecture des logs…", async (cx) => {
+      const failed = failedChecksOf(pr);
+      const logs = [];
+      for (const runId of actionsRunIds(failed)) {
+        const out = await runWithFolderEnv(["gh", "run", "view", runId, "--log-failed"], main, machine).catch(() => "");
+        const lines = out.split("\n").map(ciLogText).filter((l) => l.trim());
+        if (lines.length) logs.push(lines.slice(-CI_LOG_LINES_PER_RUN).join("\n"));
+      }
+      const checkList = failed.map((c) => `- ${c.name}${c.url ? ` : ${c.url}` : ""}`).join("\n");
+      const message = [
+        `La CI de la PR #${pr.number} échoue. Trouve la cause, corrige, commite et pousse sur cette branche.`,
+        `Checks en échec :\n${checkList}`,
+        logs.length ? `Fin des logs des jobs en échec :\n\`\`\`\n${logs.join("\n\n")}\n\`\`\`` : null,
+      ].filter(Boolean).join("\n\n");
+      const r = await hc(["send", a.address, message]);
+      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "envoi à l'agent impossible");
+      this.setLifecycle(prKey, { sentForHead: pr.headRefOid }, cx);
+    }, cx);
+  }
+
+  // Once merged: closes the spaces on the worktree, removes it, then deletes the local branch.
+  // Refuses a worktree with uncommitted changes; keeps a branch holding commits the PR didn't merge.
+  cleanUpMerged(prKey, session, pr, cx) {
+    const [machine, main, branch] = JSON.parse(prKey);
+    const top = this.sessionGit[session.key]?.top;
+    if (!top || top === main) return;
+    this.runLifecycleStep(prKey, "Nettoyage…", async (cx) => {
+      const status = await runGit(["--no-optional-locks", "status", "--porcelain"], top, machine);
+      if (!status.ok) throw new Error(status.err || "git status a échoué");
+      if (status.out) throw new Error("modifications non commitées dans le worktree : nettoyage annulé");
+      const ps = panes();
+      const closing = spaces().filter((s) => (s.machine ?? null) === machine && (isInside(s.folder, top) || isInside(place(s, ps), top)));
+      const closingTerminals = new Set(closing.flatMap((s) => {
+        const tabs = new Set((s.tabs ?? []).map((tab) => tab.id));
+        return ps.filter((p) => p.terminal && tabs.has(p.tab)).map((p) => p.terminal);
+      }));
+      for (const s of closing) run("space.close", { id: s.id, confirmed: true });
+      // The card goes with the space: from here on, failures can only be told in a notification.
+      try {
+        const deadline = Date.now() + SPACE_CLOSE_WAIT;
+        while (terminals().some((k) => k.state === "live" && closingTerminals.has(k.address))) {
+          if (Date.now() >= deadline) throw new Error("les terminaux du space ne se sont pas arrêtés");
+          await cx.sleep(50);
+        }
+        const removed = await runGit(["worktree", "remove", top], main, machine);
+        if (!removed.ok) throw new Error(removed.err || "git worktree remove a échoué");
+        const head = (await runGit(["rev-parse", `refs/heads/${branch}`], main, machine)).out;
+        const deleted = await runGit(["branch", head === pr.headRefOid ? "-D" : "-d", branch], main, machine);
+        notify(deleted.ok
+          ? { title: `#${pr.number} nettoyée`, body: `Worktree et branche ${branch} supprimés.`, level: "success" }
+          : { title: `#${pr.number} : worktree supprimé, branche gardée`, body: `${branch} a des commits absents de la PR (${deleted.err}).`, level: "warning" });
+      } catch (error) {
+        notify({ title: `#${pr.number} : nettoyage interrompu`, body: String(error?.message ?? error), level: "error" });
+      }
+      delete this.pullRequests[prKey];
+    }, cx);
   }
 
   restedRecently(a, now) {
@@ -605,6 +845,9 @@ export default class Spaces extends View {
     const shownBranch = branch && branch !== "main" && branch !== "master" ? branch : null;
     const detailIndent = 16 + SESSION_GAP;
     const reason = a.status === "blocked" ? blockedReason(a, a.report) : null;
+    const pr = place.prKey ? this.pullRequests[place.prKey]?.pr ?? null : null;
+    const lifecycle = place.key ? this.lifecycle[stepKey(place)] : null;
+    const nextStep = this.nextStepButton(a, place, pr, ticket, t, detailIndent);
     return v_flex()
       .id(`card-${a.address}`)
       .flex_none()
@@ -630,12 +873,84 @@ export default class Spaces extends View {
         .child(svg("mods/gh-issues/icons/issue.svg").size(12).flex_none().text_color(t.ansi2))
         .child(div().flex_none().font_semibold().text_color(t.ansi2).child(`#${issue}`))
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(ticket?.title ?? ""))))
+      .when(Boolean(pr), (el) => el.child(this.pullRequestLine(a, pr, t, detailIndent)))
+      .when(Boolean(nextStep), (el) => el.child(nextStep))
+      .when(Boolean(lifecycle?.error), (el) => el.child(div().pl(detailIndent).text_size(11).text_color(t.ansi1).child(lifecycle.error)))
       .child(h_flex().pl(detailIndent).gap(5).items_center().text_size(11).text_color(t.dim)
         .child(svg(`mods/workspace-chrome/${g || branch ? "git-branch" : "folder"}.svg`).size(12).flex_none())
         .child(div().flex_initial().min_w(0).truncate().child([a.space_name !== repo ? a.space_name : null, repo].filter(Boolean).join(" · ") || "?"))
         .when(Boolean(shownBranch) && shownBranch !== a.space_name, (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(shownBranch)))
         .when(!shownBranch || shownBranch === a.space_name, (el) => el.child(div().flex_1()))
         .when(Boolean(g?.linked), (el) => el.child(div().flex_none().px(4).h(14).rounded(3).border_1().border_color(t.dim + "66").text_size(10).text_color(t.muted).flex().items_center().child("worktree"))));
+  }
+
+  // "#12 ✗ ouverte · CI en échec": a click opens the PR.
+  pullRequestLine(a, pr, t, detailIndent) {
+    const look = pullRequestLook(pr, t);
+    const checks = pr.state === "OPEN" ? CHECKS_LOOK[checksOutcome(pr)] : null;
+    return h_flex().id(`card-pr-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
+      .tooltip("Ouvrir la PR sur GitHub")
+      .on_click((_e, cx) => { cx.stop_propagation(); openUrl(pr.url, cx); })
+      .child(svg(look.icon).size(12).flex_none().text_color(look.color))
+      .child(div().flex_none().font_semibold().text_color(look.color).child(`#${pr.number}`))
+      .when(Boolean(checks), (el) => el.child(checks === CHECKS_LOOK.pending
+        ? div().flex_none().text_color(t.working).frames(["◐", "◓", "◑", "◒"], 160)
+        : div().flex_none().text_color(t[checks.tone]).child(checks.glyph)))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child([look.label, checks?.label].filter(Boolean).join(" · ")));
+  }
+
+  // What comes next for a session at rest: open its PR, hand it the failing CI, or clean up once merged.
+  nextStepButton(a, session, pr, ticket, t, detailIndent) {
+    if (!RESTING_STATUSES.includes(a.status)) return null;
+    const { prKey } = session;
+    const lifecycle = this.lifecycle[stepKey(session)] ?? {};
+    const button = (id, label, tint, tooltip, onPress) => h_flex().pl(detailIndent).child(
+      div().id(`card-step-${id}-${a.address}`).h(20).px(8).flex().flex_none().items_center().rounded(5)
+        .text_size(11).font_medium().border_1().border_color(tint + "55").bg(tint + "1a").text_color(tint)
+        .when(!lifecycle.busy, (el) => el.cursor_pointer().hover((s) => s.bg(tint + "33")))
+        .tooltip(tooltip)
+        .on_click((_e, cx) => { cx.stop_propagation(); if (!lifecycle.busy) onPress(cx); })
+        .child(lifecycle.busy ?? label));
+    const sg = this.sessionGit[session.key];
+    if (sg && PUSHED_DIRECTLY_BRANCHES.has(sg.branch)) {
+      if (sg.uncommitted > 0) {
+        if ((lifecycle.commitAskedAt ?? 0) > sg.at) return h_flex().pl(detailIndent).text_size(11).text_color(t.dim).child("Commit et push demandés à l'agent");
+        return button("commit-push", `Commit & push (${sg.uncommitted})`, t.accent,
+          `Demande à l'agent de commiter ses ${sg.uncommitted} fichier${sg.uncommitted > 1 ? "s" : ""} modifié${sg.uncommitted > 1 ? "s" : ""} puis de pousser sur ${sg.branch}`,
+          (cx) => this.askCommitAndPush(a, session, sg.branch, cx));
+      }
+      if (sg.unpushed > 0) {
+        return button("push", `Push ↑${sg.unpushed}`, t.accent, `git push de ${sg.branch} vers son upstream`,
+          (cx) => this.pushTrunk(session, cx));
+      }
+      return null;
+    }
+    const known = prKey ? this.pullRequests[prKey] : null;
+    if (!known?.answered) return null;
+    if (!pr && sg?.commitsAhead > 0) {
+      return button("open-pr", "Ouvrir la PR", t.accent, `Pousse ${sg.branch} et ouvre sa PR${session.issue ? ` (Closes #${session.issue})` : ""}`,
+        (cx) => this.openPullRequest(prKey, session, ticket, cx));
+    }
+    if (pr?.state === "OPEN" && checksOutcome(pr) === "failure") {
+      if (lifecycle.sentForHead === pr.headRefOid) return h_flex().pl(detailIndent).text_size(11).text_color(t.dim).child("Logs de CI envoyés à l'agent");
+      return button("fix-ci", "Corriger la CI", t.ansi1, "Envoie les checks en échec et la fin de leurs logs à l'agent",
+        (cx) => this.sendFailingCi(prKey, a, pr, cx));
+    }
+    if (pr?.state === "MERGED" && sg?.linked) {
+      const confirming = (lifecycle.confirmCleanUntil ?? 0) > Date.now();
+      return button("clean", confirming ? "Confirmer le nettoyage" : "Nettoyer", t.ansi5,
+        "Ferme le space, supprime le worktree et la branche locale",
+        (cx) => {
+          if ((this.lifecycle[prKey]?.confirmCleanUntil ?? 0) <= Date.now()) {
+            this.setLifecycle(prKey, { confirmCleanUntil: Date.now() + CLEAN_CONFIRM_MS }, cx);
+            cx.timer.after(CLEAN_CONFIRM_MS, (cx) => cx.notify());
+            return;
+          }
+          this.setLifecycle(prKey, { confirmCleanUntil: 0 }, cx);
+          this.cleanUpMerged(prKey, session, pr, cx);
+        });
+    }
+    return null;
   }
 
   // On the rail a card shrinks to its space's avatar with the status mark on its corner; the tooltip says the rest.
