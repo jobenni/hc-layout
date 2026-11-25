@@ -50,6 +50,8 @@ export default class Tabs extends View {
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
     const stop = (_e, cx) => cx.stop_propagation();
+    const update = shared("benni.update"); // written by benni-spaces and benni-settings: { installed, latest }
+    const updateAvailable = !!(update?.installed && update.latest && update.installed !== update.latest);
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const item = (c, i) => {
@@ -98,7 +100,9 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
       .child(panelButton("graph", "Graph", "mods/git-graph/icons/graph.svg"))
       .child(panelButton("issues", "Issues", "mods/gh-issues/icons/issue.svg"))
-      .child(button("settings", svg("mods/workspace-chrome/settings.svg").size(14), () => openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 })).tooltip("Réglages"))
+      .child(button("settings", svg("mods/workspace-chrome/settings.svg").size(14), () => openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 }))
+        .relative().tooltip(updateAvailable ? "Réglages · mise à jour disponible" : "Réglages")
+        .when(updateAvailable, el => el.child(div().absolute().top(4).right(4).size(7).rounded(4).bg(t.accent).border(1).border_color(t.chrome))))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs-graph/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs-graph/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs-graph/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))));
