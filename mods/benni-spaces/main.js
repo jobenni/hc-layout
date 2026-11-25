@@ -164,6 +164,7 @@ function agentIcon(program, size, color, bot = false) {
 // this list reads them and records where a dropped space goes. Mods can't share modules, so
 // this reader repeats benni-settings' own: same key, same rules.
 const WORKSPACES_KEY = "benni.workspaces";
+const WORKSPACE_GAP = 18;
 const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
 // A space made from a workspace's "+" joins it if it shows up within this long.
 const NEW_SPACE_WAIT = 10000;
@@ -379,7 +380,7 @@ export default class Spaces extends View {
       });
   }
 
-  workspaceHeader(ws, rows, folded, t, collapsed) {
+  workspaceHeader(ws, rows, folded, t, collapsed, gapAbove) {
     const dropping = this.pressed !== null && this.over === workspaceDropKey(ws.id);
     const header = h_flex().id(`workspace-${ws.id}`).flex_none().items_center().rounded(7).cursor_pointer()
       .when(dropping, (el) => el.bg(t.accent + "26"))
@@ -387,16 +388,16 @@ export default class Spaces extends View {
       .on_click((_e, cx) => this.toggleWorkspaceFold(ws.id, cx))
       .on_mouse_down("right", openSettings);
     if (collapsed) {
-      return railCell(this.workspaceDropTarget(header, ws).w(RAIL_CELL).h(20).mt(6).justify_center()
+      return railCell(this.workspaceDropTarget(header, ws).w(RAIL_CELL).h(20).mt(gapAbove).justify_center()
         .tooltip(`${ws.name} · ${rows.length} space${rows.length > 1 ? "s" : ""}`)
         .text_size(10).font_bold().text_color(t.dim).child([...ws.name].slice(0, 2).join("").toUpperCase()));
     }
     const active = rows.some((r) => r.w.active);
-    return this.workspaceDropTarget(header, ws).h(28).mt(6).pl(6).pr(4).gap(6)
+    return this.workspaceDropTarget(header, ws).h(28).mt(gapAbove).pl(6).pr(4).gap(6)
       .text_size(11.5).font_semibold().text_color(active ? t.foreground : t.muted)
       .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(12).flex_none().text_color(t.dim))
       .child(div().flex_initial().min_w(0).truncate().child(ws.name))
-      .child(div().flex_none().px(5).h(15).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).flex().items_center().child(String(rows.length)))
+      .child(div().flex_none().px(5).h(16).rounded(4).bg(t.dim + "40").text_size(11).text_color(t.foreground).flex().items_center().child(String(rows.length)))
       .child(div().flex_1())
       .child(div().id(`workspace-new-${ws.id}`).size(22).flex_none().flex().items_center().justify_center().rounded(5)
         .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(`Nouveau space dans ${ws.name}`)
@@ -892,7 +893,7 @@ export default class Spaces extends View {
     for (const ws of workspaces) {
       const mine = rowsOf(ws);
       const folded = this.foldedWorkspaces.has(ws.id);
-      items.push(this.workspaceHeader(ws, mine, folded, t, collapsed));
+      items.push(this.workspaceHeader(ws, mine, folded, t, collapsed, items.length ? WORKSPACE_GAP : 6));
       if (folded) continue;
       // Machines without spaces yet are offered in the default workspace only.
       const section = this.machineItems(mine, t, collapsed, draw, ws.id === DEFAULT_WORKSPACE.id);
