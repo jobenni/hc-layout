@@ -7,23 +7,11 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, props, closeOverlay, theme, shared, setShared, exec, readTextFile, appHome, checking, notify } from "herdr";
 
-const WORKSPACES_KEY = "benni.workspaces";
-const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
-const SECTIONS = [
-  { id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" },
-  { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
-];
-
-// install.sh records the commit it installed in <appHome>/hc-layout.json.
+// The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
+// install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
 const LAYOUT_REPO = "https://github.com/jobenni/hc-layout.git";
 const LAYOUT_BRANCH = "main";
-const INSTALL_FROM_GITHUB = [
-  'set -e',
-  'source=$(mktemp -d)',
-  'trap \'rm -rf "$source"\' EXIT',
-  'git clone --depth 1 --quiet --branch "$2" "$1" "$source"',
-  'HERDR_APP_HOME="$3" bash "$source/install.sh"',
-].join("\n");
+const UPDATE_KEY = "benni.update";
 
 async function readInstalledCommit() {
   const text = await readTextFile(`${appHome()}/hc-layout.json`);
@@ -36,6 +24,21 @@ async function readLatestCommit() {
   if (!commit) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
   return commit;
 }
+
+const WORKSPACES_KEY = "benni.workspaces";
+const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
+const SECTIONS = [
+  { id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" },
+  { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
+];
+
+const INSTALL_FROM_GITHUB = [
+  'set -e',
+  'source=$(mktemp -d)',
+  'trap \'rm -rf "$source"\' EXIT',
+  'git clone --depth 1 --quiet --branch "$2" "$1" "$source"',
+  'HERDR_APP_HOME="$3" bash "$source/install.sh"',
+].join("\n");
 
 const shortCommit = (commit) => commit ? commit.slice(0, 7) : "inconnue";
 
@@ -61,7 +64,8 @@ function workspaceOfSpace(store, spaceId) {
 export default class Settings extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
-    this.section = SECTIONS[0].id;
+    const lastCheck = shared(UPDATE_KEY);
+    this.section = lastCheck?.installed && lastCheck.latest && lastCheck.installed !== lastCheck.latest ? "update" : SECTIONS[0].id;
     this.renaming = null; // workspace id whose name is being edited
     this.deleting = null; // workspace id waiting for its confirmation
     this.addInput = InputState.new({ placeholder: "Nouveau workspace (ex. Perso)" });
@@ -81,6 +85,7 @@ export default class Settings extends View {
         const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit()]);
         const phase = !installed ? "unknown" : installed === latest ? "current" : "outdated";
         this.update = { phase, installed, latest, error: "" };
+        setShared(UPDATE_KEY, { installed, latest });
       } catch (error) {
         this.update = { ...this.update, phase: "error", error: String(error?.message ?? error) };
       }
@@ -98,6 +103,7 @@ export default class Settings extends View {
       if (result.code === 0) {
         notify({ title: "Layout mis à jour", body: `Version ${shortCommit(this.update.latest)} installée.`, level: "success" });
         this.update = { ...this.update, phase: "current", installed: this.update.latest };
+        setShared(UPDATE_KEY, { installed: this.update.latest, latest: this.update.latest });
       } else {
         const lastLines = (result.stderr || result.stdout).trim().split("\n").slice(-4).join("\n");
         this.update = { ...this.update, phase: "failed", error: lastLines || `install.sh a échoué (code ${result.code})` };

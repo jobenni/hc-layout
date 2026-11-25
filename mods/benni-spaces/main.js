@@ -5,7 +5,29 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, checking } from "herdr";
+
+// The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
+// install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
+const LAYOUT_REPO = "https://github.com/jobenni/hc-layout.git";
+const LAYOUT_BRANCH = "main";
+const UPDATE_KEY = "benni.update";
+
+async function readInstalledCommit() {
+  const text = await readTextFile(`${appHome()}/hc-layout.json`);
+  try { return JSON.parse(text ?? "")?.commit || null; } catch { return null; }
+}
+
+async function readLatestCommit() {
+  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${LAYOUT_BRANCH}`], { timeout: 20000 });
+  const commit = result.code === 0 ? result.stdout.split(/\s/)[0] : "";
+  if (!commit) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+  return commit;
+}
+const UPDATE_FIRST_CHECK_DELAY = 15000;
+const UPDATE_CHECK_INTERVAL = 60 * 1000;
+const UPDATE_NOTICE_DURATION = 10 * 1000;
+
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -293,6 +315,29 @@ export default class Spaces extends View {
     cx.timer.every(30000, cx => cx.notify());
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
+    if (!checking()) {
+      cx.timer.after(UPDATE_FIRST_CHECK_DELAY, (cx) => this.checkLayoutUpdate(cx));
+      cx.timer.every(UPDATE_CHECK_INTERVAL, (cx) => this.checkLayoutUpdate(cx));
+    }
+  }
+
+  // Notifies once per new commit on GitHub; a layout installed by hand (no recorded commit) is never nagged.
+  checkLayoutUpdate(cx) {
+    cx.spawn(async () => {
+      try {
+        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit()]);
+        setShared(UPDATE_KEY, { installed, latest });
+        if (!installed || installed === latest || localStorage.getItem("update.notified") === latest) return;
+        localStorage.setItem("update.notified", latest);
+        notify({
+          title: "Nouvelle version du layout",
+          body: "Clique pour l'installer depuis les Réglages.",
+          level: "info",
+          timeout: UPDATE_NOTICE_DURATION,
+          action: { name: "mod.open", args: { name: "benni-settings" } },
+        });
+      } catch { /* offline: try again at the next tick */ }
+    });
   }
 
   checkNew(cx) {
