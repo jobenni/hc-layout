@@ -116,6 +116,8 @@ const FAILED_CHECK_VERDICTS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACT
 const PENDING_CHECK_VERDICTS = new Set(["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"]);
 const CI_LOG_LINES_PER_RUN = 80;
 const CLEAN_CONFIRM_MS = 4000;
+// hc send pauses about a second before pasting; longer means it holds for a draft typed in the session.
+const DRAFT_HOLD_HINT_MS = 2000;
 const SPACE_CLOSE_WAIT = 10000;
 const ICONS = "mods/gh-issues/icons";
 
@@ -766,12 +768,25 @@ export default class Spaces extends View {
     };
   }
 
+  // Types the message into the agent's prompt; the card says so when hc send waits for the person's draft.
+  async sendToAgent(key, a, message, cx) {
+    let delivered = false;
+    cx.timer.after(DRAFT_HOLD_HINT_MS, (cx) => {
+      if (!delivered) this.setLifecycle(key, { busy: "En attente de ton brouillon…" }, cx);
+    });
+    try {
+      const r = await hc(["send", a.address, message]);
+      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "envoi à l'agent impossible");
+    } finally {
+      delivered = true;
+    }
+  }
+
   // The agent knows what it changed, so it writes the commit message; the card waits for its next git read.
   askCommitAndPush(a, session, branch, cx) {
     this.runLifecycleStep(stepKey(session), "Envoi…", async (cx) => {
       const message = `Commite tous les changements en cours (des commits cohérents, avec des messages clairs), puis pousse sur ${branch}.`;
-      const r = await hc(["send", a.address, message]);
-      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "envoi à l'agent impossible");
+      await this.sendToAgent(stepKey(session), a, message, cx);
       this.setLifecycle(stepKey(session), { commitAskedAt: Date.now() }, cx);
     }, cx);
   }
@@ -815,8 +830,7 @@ export default class Spaces extends View {
         `Checks en échec :\n${checkList}`,
         logs.length ? `Fin des logs des jobs en échec :\n\`\`\`\n${logs.join("\n\n")}\n\`\`\`` : null,
       ].filter(Boolean).join("\n\n");
-      const r = await hc(["send", a.address, message]);
-      if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "envoi à l'agent impossible");
+      await this.sendToAgent(prKey, a, message, cx);
       this.setLifecycle(prKey, { sentForHead: pr.headRefOid }, cx);
     }, cx);
   }
