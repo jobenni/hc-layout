@@ -254,7 +254,6 @@ function agentIcon(program, size, color, bot = false) {
 // this list reads them and records where a dropped space goes. Mods can't share modules, so
 // this reader repeats benni-settings' own: same key, same rules.
 const WORKSPACES_KEY = "benni.workspaces";
-const WORKSPACE_GAP = 18;
 const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
 // A space made from a workspace's "+" joins it if it shows up within this long.
 const NEW_SPACE_WAIT = 10000;
@@ -307,7 +306,8 @@ export default class Spaces extends View {
     } catch { this.reconnecting = {}; }
     try { this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]")); } catch { this.folded = new Set(); }
     try { this.foldedSpaces = new Set(JSON.parse(localStorage.getItem("spaces.folded") ?? "[]")); } catch { this.foldedSpaces = new Set(); }
-    try { this.foldedWorkspaces = new Set(JSON.parse(localStorage.getItem("workspaces.folded") ?? "[]")); } catch { this.foldedWorkspaces = new Set(); }
+    this.selectedWorkspace = localStorage.getItem("workspaces.selected") ?? DEFAULT_WORKSPACE.id; // the tab whose spaces the list shows
+    this.followedActiveSpace = null; // the active space the selected tab last followed
     this.newSpaceWorkspace = null; // { id, at, known }: the workspace a space being made from the sidebar joins
     this.lastRows = []; // the rows last drawn, with their workspace: a dropped space takes its worktrees along
     try { this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}"); } catch { this.changed = {}; }
@@ -473,13 +473,24 @@ export default class Spaces extends View {
     this.moveToWorkspace(made.id, pending.id);
   }
 
-  toggleWorkspaceFold(id, cx) {
-    this.foldedWorkspaces.has(id) ? this.foldedWorkspaces.delete(id) : this.foldedWorkspaces.add(id);
-    localStorage.setItem("workspaces.folded", JSON.stringify([...this.foldedWorkspaces]));
-    cx.notify();
+  selectWorkspace(id, cx) {
+    this.selectedWorkspace = id;
+    localStorage.setItem("workspaces.selected", id);
+    cx?.notify();
   }
 
-  // A workspace header or its empty slot takes a dragged space.
+  // The selected tab follows the active space when another one becomes active, from anywhere.
+  shownWorkspace(store, rows) {
+    const active = rows.find((r) => r.w.active);
+    if (active && active.w.id !== this.followedActiveSpace) {
+      this.followedActiveSpace = active.w.id;
+      if (active.ws !== this.selectedWorkspace) this.selectWorkspace(active.ws);
+    }
+    if (!store.list.some((w) => w.id === this.selectedWorkspace)) this.selectedWorkspace = DEFAULT_WORKSPACE.id;
+    return this.selectedWorkspace;
+  }
+
+  // A workspace tab or its empty slot takes a dragged space.
   workspaceDropTarget(el, ws) {
     const key = workspaceDropKey(ws.id);
     return el
@@ -495,29 +506,33 @@ export default class Spaces extends View {
       });
   }
 
-  workspaceHeader(ws, rows, folded, t, collapsed, gapAbove) {
+  workspaceTab(ws, rows, selected, t, collapsed) {
     const dropping = this.pressed !== null && this.over === workspaceDropKey(ws.id);
-    const header = h_flex().id(`workspace-${ws.id}`).flex_none().items_center().rounded(7).cursor_pointer()
+    const holdsActiveSpace = rows.some((r) => r.w.active);
+    const tab = h_flex().id(`workspace-${ws.id}`).flex_none().items_center().rounded(6).cursor_pointer()
       .when(dropping, (el) => el.bg(t.accent + "26"))
-      .when(!dropping, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click((_e, cx) => this.toggleWorkspaceFold(ws.id, cx))
-      .on_mouse_down("right", openSettings);
+      .when(!dropping && selected, (el) => el.bg(t.selected))
+      .when(!dropping && !selected, (el) => el.hover((s) => s.bg(t.hover)))
+      .on_click((_e, cx) => this.selectWorkspace(ws.id, cx))
+      .on_mouse_down("right", openSettings)
+      .tooltip(`${ws.name} · ${rows.length} space${rows.length > 1 ? "s" : ""}`);
     if (collapsed) {
-      return railCell(this.workspaceDropTarget(header, ws).w(RAIL_CELL).h(20).mt(gapAbove).justify_center()
-        .tooltip(`${ws.name} · ${rows.length} space${rows.length > 1 ? "s" : ""}`)
-        .text_size(10).font_bold().text_color(t.dim).child([...ws.name].slice(0, 2).join("").toUpperCase()));
+      return railCell(this.workspaceDropTarget(tab, ws).w(RAIL_CELL).h(22).justify_center()
+        .text_size(10).font_bold().text_color(selected ? t.foreground : t.dim).child([...ws.name].slice(0, 2).join("").toUpperCase()));
     }
-    const active = rows.some((r) => r.w.active);
-    return this.workspaceDropTarget(header, ws).h(28).mt(gapAbove).pl(6).pr(4).gap(6)
-      .text_size(11.5).font_semibold().text_color(active ? t.foreground : t.muted)
-      .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(12).flex_none().text_color(t.dim))
-      .child(div().flex_initial().min_w(0).truncate().child(ws.name))
-      .child(div().flex_none().px(5).h(16).rounded(4).bg(t.dim + "40").text_size(11).text_color(t.foreground).flex().items_center().child(String(rows.length)))
-      .child(div().flex_1())
-      .child(div().id(`workspace-new-${ws.id}`).size(22).flex_none().flex().items_center().justify_center().rounded(5)
-        .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(`Nouveau space dans ${ws.name}`)
-        .on_click((_e, cx) => { cx.stop_propagation(); this.newSpaceIn(ws.id); })
-        .child(svg("mods/workspace-chrome/plus.svg").size(12)));
+    return this.workspaceDropTarget(tab, ws).h(24).px(8).gap(5)
+      .text_size(11.5).font_semibold().text_color(selected ? t.foreground : t.muted)
+      .child(ws.name)
+      .child(div().text_size(10.5).text_color(t.dim).child(String(rows.length)))
+      .when(holdsActiveSpace && !selected, (el) => el.child(div().size(5).rounded_full().flex_none().bg(t.accent)));
+  }
+
+  workspaceTabs(t, collapsed) {
+    const store = readWorkspaces();
+    const shown = this.shownWorkspace(store, this.lastRows);
+    const tabs = store.list.map((ws) => this.workspaceTab(ws, this.lastRows.filter((r) => r.ws === ws.id), ws.id === shown, t, collapsed));
+    if (collapsed) return v_flex().flex_none().gap(2).pb(6).children(tabs);
+    return h_flex().id("workspace-tabs").flex_none().h(32).px(8).gap(2).items_center().overflow_x_scroll().children(tabs);
   }
 
   emptyWorkspace(ws, t, collapsed) {
@@ -1232,7 +1247,7 @@ export default class Spaces extends View {
     return out.filter(r => this.shown.has(r.w.id));
   }
 
-  // With workspaces on, each one's header comes first, then its spaces grouped the same way.
+  // With workspaces on, the list shows the selected tab's spaces only.
   grouped(t, collapsed) {
     const rows = this.ordered();
     const store = readWorkspaces();
@@ -1262,20 +1277,10 @@ export default class Spaces extends View {
     const childIndexOf = (list, found) => found < 0 ? -1 : list.slice(0, found).reduce((n, r) => n + 1 + rowsUnder(r), 0);
     const draw = { drawAll, childIndexOf };
     if (!workspaces) return this.machineItems(rows, t, collapsed, draw, true);
-    const items = [];
-    let activeAt = -1;
-    for (const ws of workspaces) {
-      const mine = rowsOf(ws);
-      const folded = this.foldedWorkspaces.has(ws.id);
-      items.push(this.workspaceHeader(ws, mine, folded, t, collapsed, items.length ? WORKSPACE_GAP : 6));
-      if (folded) continue;
-      // Machines without spaces yet are offered in the default workspace only.
-      const section = this.machineItems(mine, t, collapsed, draw, ws.id === DEFAULT_WORKSPACE.id);
-      if (this.activeAt >= 0) activeAt = items.length + this.activeAt;
-      items.push(...(section.length ? section : [this.emptyWorkspace(ws, t, collapsed)]));
-    }
-    this.activeAt = activeAt;
-    return items;
+    const shown = workspaces.find((ws) => ws.id === this.shownWorkspace(store, rows));
+    // Machines without spaces yet are offered in the default workspace only.
+    const section = this.machineItems(rowsOf(shown), t, collapsed, draw, shown.id === DEFAULT_WORKSPACE.id);
+    return section.length ? section : [this.emptyWorkspace(shown, t, collapsed)];
   }
 
   // Sets this.activeAt to where the active space's row lands among the children this returns: the list
@@ -1544,10 +1549,10 @@ export default class Spaces extends View {
           .child(svg(`mods/benni-spaces/chevrons-${this.allSpacesFolded() ? "up-down" : "down-up"}.svg`).size(14))))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => {
-            const activeWorkspace = this.lastRows.find((r) => r.w.active)?.ws;
-            if (readWorkspaces().enabled && activeWorkspace) this.newSpaceIn(activeWorkspace);
+            if (readWorkspaces().enabled) this.newSpaceIn(this.selectedWorkspace);
             else run("space.new");
           }).child(svg("mods/workspace-chrome/plus.svg").size(14))))
+      .when(readWorkspaces().enabled, (el) => el.child(this.workspaceTabs(t, collapsed)))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
