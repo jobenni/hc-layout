@@ -5,7 +5,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, checking } from "herdr";
+import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, checking, updates } from "herdr";
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
@@ -1507,6 +1507,20 @@ export default class Spaces extends View {
       .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));
   }
 
+  // Herdr's own settings, with a dot when an app update is ready: the native footer that held it is not in this layout.
+  herdrSettingsButton(t, collapsed) {
+    const updateReady = div().size(6).rounded_full().bg(t.accent);
+    return h_flex().flex_none().border_t(1).border_color(t.border).px(8).pt(4).pb(8)
+      .when(collapsed, (el) => el.px(0).justify_center())
+      .child(h_flex().id("herdr-settings").flex_1().h(28).px(8).gap(9).items_center().rounded(8).cursor_pointer()
+        .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .when(collapsed, (el) => el.flex_none().relative().w(32).px(0).justify_center().tooltip("Settings"))
+        .on_click(() => run("app.settings"))
+        .child(svg("mods/workspace-chrome/settings.svg").size(14))
+        .when(!collapsed, (el) => el.child(div().flex_1().child("Settings")))
+        .when(Boolean(updates().app.ready), (el) => el.child(collapsed ? updateReady.absolute().top(5).right(6) : updateReady)));
+  }
+
   render() {
     const t = theme();
     const collapsed = narrow();
@@ -1558,6 +1572,7 @@ export default class Spaces extends View {
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
         .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
         .children(list))
+      .child(this.herdrSettingsButton(t, collapsed))
       .when(collapsed, el => el.child(h_flex().h(44).flex_none().items_center().justify_center()
         .child(div().id("sidebar-unfold").size(32).flex().items_center().justify_center().rounded(6)
           .text_size(24).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
