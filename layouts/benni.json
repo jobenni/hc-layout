@@ -93,7 +93,17 @@
                   "gap": 8,
                   "lone": true
                 }
-              }
+              },
+              "floating": [
+                {
+                  "id": "workflow-button",
+                  "content": {
+                    "mod": "claude-workflow"
+                  },
+                  "edge": "bottom",
+                  "align": "end"
+                }
+              ]
             },
             {
               "id": "panel",
