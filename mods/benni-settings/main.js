@@ -1,15 +1,43 @@
 // The layout's own settings, opened as a dialog from the tab bar's gear.
-// Sections on the left; for now only Workspaces: groups of spaces above the Spaces list.
+// Sections on the left: Workspaces (groups of spaces above the Spaces list) and Mise à jour.
 // Workspaces live in shared("benni.workspaces") = { enabled, list: [{ id, name }], of: { spaceId: workspaceId } },
 // which benni-spaces reads; a space with no workspace (or a deleted one's) is in the default one.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, props, closeOverlay, theme, shared, setShared } from "herdr";
+import { spaces, props, closeOverlay, theme, shared, setShared, exec, readTextFile, appHome, checking, notify } from "herdr";
 
 const WORKSPACES_KEY = "benni.workspaces";
 const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
-const SECTIONS = [{ id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" }];
+const SECTIONS = [
+  { id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" },
+  { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
+];
+
+// install.sh records the commit it installed in <appHome>/hc-layout.json.
+const LAYOUT_REPO = "https://github.com/jobenni/hc-layout.git";
+const LAYOUT_BRANCH = "main";
+const INSTALL_FROM_GITHUB = [
+  'set -e',
+  'source=$(mktemp -d)',
+  'trap \'rm -rf "$source"\' EXIT',
+  'git clone --depth 1 --quiet --branch "$2" "$1" "$source"',
+  'HERDR_APP_HOME="$3" bash "$source/install.sh"',
+].join("\n");
+
+async function readInstalledCommit() {
+  const text = await readTextFile(`${appHome()}/hc-layout.json`);
+  try { return JSON.parse(text ?? "")?.commit || null; } catch { return null; }
+}
+
+async function readLatestCommit() {
+  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${LAYOUT_BRANCH}`], { timeout: 20000 });
+  const commit = result.code === 0 ? result.stdout.split(/\s/)[0] : "";
+  if (!commit) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+  return commit;
+}
+
+const shortCommit = (commit) => commit ? commit.slice(0, 7) : "inconnue";
 
 function readWorkspaces() {
   const stored = shared(WORKSPACES_KEY) ?? {};
@@ -40,7 +68,42 @@ export default class Settings extends View {
     this.addInput.on("submit", (_e, cx) => this.addWorkspace(cx));
     this.renameInput = InputState.new({});
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
+    this.update = { phase: "checking", installed: null, latest: null, error: "" };
     this.handle.focus();
+    if (!checking()) this.checkForUpdate(cx);
+  }
+
+  // phase: checking, current, outdated, unknown (no record of the installed commit), error, installing, failed.
+  checkForUpdate(cx) {
+    this.update = { ...this.update, phase: "checking", error: "" };
+    cx.spawn(async (cx) => {
+      try {
+        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit()]);
+        const phase = !installed ? "unknown" : installed === latest ? "current" : "outdated";
+        this.update = { phase, installed, latest, error: "" };
+      } catch (error) {
+        this.update = { ...this.update, phase: "error", error: String(error?.message ?? error) };
+      }
+      cx.notify();
+    });
+  }
+
+  // install.sh replaces this mod too, so Herdr may reload the dialog before the result shows.
+  installUpdate(cx) {
+    this.update = { ...this.update, phase: "installing", error: "" };
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const result = await exec("bash", ["-c", INSTALL_FROM_GITHUB, "bash", LAYOUT_REPO, LAYOUT_BRANCH, appHome()], { timeout: 300000 })
+        .catch((error) => ({ code: -1, stdout: "", stderr: String(error?.message ?? error) }));
+      if (result.code === 0) {
+        notify({ title: "Layout mis à jour", body: `Version ${shortCommit(this.update.latest)} installée.`, level: "success" });
+        this.update = { ...this.update, phase: "current", installed: this.update.latest };
+      } else {
+        const lastLines = (result.stderr || result.stdout).trim().split("\n").slice(-4).join("\n");
+        this.update = { ...this.update, phase: "failed", error: lastLines || `install.sh a échoué (code ${result.code})` };
+      }
+      cx.notify();
+    });
   }
 
   addWorkspace(cx) {
@@ -180,6 +243,30 @@ export default class Settings extends View {
         .child(this.textButton("ws-add", "Ajouter", true, t, (_e, cx) => this.addWorkspace(cx))));
   }
 
+  updateSection(t) {
+    const { phase, installed, latest, error } = this.update;
+    const status = {
+      checking: ["Recherche d'une nouvelle version…", t.muted],
+      current: ["Le layout est à jour.", t.foreground],
+      outdated: ["Une nouvelle version est disponible.", t.accent],
+      unknown: ["Version installée inconnue : la mise à jour installera la dernière.", t.foreground],
+      error: [`Vérification impossible : ${error}`, t.blocked],
+      installing: ["Installation en cours…", t.muted],
+      failed: [`Échec de la mise à jour : ${error}`, t.blocked],
+    }[phase];
+    const canInstall = ["outdated", "unknown", "failed"].includes(phase);
+    const canCheck = ["current", "error", "unknown", "outdated", "failed"].includes(phase);
+    return v_flex().gap(14)
+      .child(div().w_full().text_size(11.5).text_color(t.muted)
+        .child(`Compare le layout installé à la branche ${LAYOUT_BRANCH} de ${LAYOUT_REPO.replace("https://", "")}. La mise à jour remplace le layout et ses mods ; les anciennes versions sont gardées dans backups/.`))
+      .child(v_flex().gap(4).p(12).rounded(8).border_1().border_color(t.border).bg(t.surface)
+        .child(div().text_size(13).font_medium().text_color(status[1]).child(status[0]))
+        .child(div().text_size(11.5).text_color(t.dim).child(`Installée : ${shortCommit(installed)} · Dernière : ${shortCommit(latest)}`)))
+      .child(h_flex().gap(8)
+        .when(canInstall, (el) => el.child(this.textButton("update-install", "Mettre à jour", true, t, (_e, cx) => this.installUpdate(cx))))
+        .when(canCheck, (el) => el.child(this.textButton("update-check", "Vérifier", false, t, (_e, cx) => { this.checkForUpdate(cx); cx.notify(); }))));
+  }
+
   render() {
     const t = theme();
     const nav = SECTIONS.map((s) => h_flex().id(`section-${s.id}`).h(30).px(10).gap(8).items_center().rounded(7)
@@ -187,7 +274,8 @@ export default class Settings extends View {
       .bg(this.section === s.id ? t.selected : t.popover).text_color(this.section === s.id ? t.foreground : t.muted)
       .hover((el) => el.bg(t.hover))
       .on_click((_e, cx) => { this.section = s.id; cx.notify(); })
-      .child(svg(s.icon).size(14)).child(s.label));
+      .child(svg(s.icon).size(14)).child(div().flex_1().child(s.label))
+      .when(s.id === "update" && this.update.phase === "outdated", (el) => el.child(div().size(6).rounded(3).bg(t.accent))));
     const current = SECTIONS.find((s) => s.id === this.section);
     return h_flex().id("settings").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .size_full().min_h(0).bg(t.popover).text_color(t.foreground)
@@ -199,6 +287,7 @@ export default class Settings extends View {
           .child(div().flex_1().text_size(15).font_semibold().child(current.label))
           .child(this.iconButton("settings-close", "mods/pane/close.svg", "Fermer (Esc)", t, () => closeOverlay(props().overlay))))
         .child(v_flex().id("settings-body").flex_1().min_h(0).px(20).pb(20).overflow_y_scrollbar()
-          .when(this.section === "workspaces", (el) => el.child(this.workspacesSection(t)))));
+          .when(this.section === "workspaces", (el) => el.child(this.workspacesSection(t)))
+          .when(this.section === "update", (el) => el.child(this.updateSection(t)))));
   }
 }
