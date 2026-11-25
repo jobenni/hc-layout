@@ -98,6 +98,7 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
       .child(panelButton("graph", "Graph", "mods/git-graph/icons/graph.svg"))
       .child(panelButton("issues", "Issues", "mods/gh-issues/icons/issue.svg"))
+      .child(button("settings", svg("mods/workspace-chrome/settings.svg").size(14), () => openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 })).tooltip("Réglages"))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs-graph/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs-graph/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs-graph/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))));
