@@ -28,7 +28,7 @@ git fetch origin --prune
 git rebase origin/main
 ```
 
-En cas de conflit : `git rebase --abort`, arrête-toi et liste les fichiers en conflit. Après un rebase qui a réécrit quelque chose, `git push --force-with-lease origin canary`.
+En cas de conflit : `git rebase --abort`, arrête-toi et liste les fichiers en conflit. Si `canary` ne pointe plus sur `origin/canary` après le rebase, `git push --force-with-lease origin canary`.
 
 ## 3. Vérifier qu'il y a quelque chose à déployer
 
@@ -38,7 +38,9 @@ git log --oneline origin/main..canary
 
 Vide : réponds « rien à déployer » et arrête-toi.
 
-Lance `herdr-app check mods/<mod>` sur chaque mod modifié (`git diff --name-only origin/main..canary -- mods/`). Un échec : arrête-toi.
+Lance `herdr-app check mods/<mod>` sur chaque mod modifié (`git diff --name-only origin/main..canary -- mods/ | cut -d/ -f2 | sort -u`). Un échec : arrête-toi.
+
+Note si des commits `feat` ou `fix` touchent `mods/` sans que `RECIPE.md` change (`git diff --quiet origin/main..canary -- RECIPE.md`) : tu le signaleras à la fin, sans bloquer.
 
 ## 4. Squash dans main
 
@@ -75,4 +77,4 @@ Si le `diff` n'est pas vide, ne réinitialise rien : arrête-toi et montre la di
 
 ## 6. Finir
 
-Reste sur `canary`. Réponds en une ou deux lignes : le commit créé sur `main` (hash court et titre) et le nombre de commits de `canary` qu'il regroupe. Les installations Stable verront la mise à jour à leur prochaine vérification (une minute au plus).
+Reste sur `canary`. Réponds en une ou deux lignes : le commit créé sur `main` (hash court et titre), le nombre de commits de `canary` qu'il regroupe, et l'éventuel `RECIPE.md` non mis à jour noté à l'étape 3. Les installations Stable verront la mise à jour à leur prochaine vérification (une minute au plus).
