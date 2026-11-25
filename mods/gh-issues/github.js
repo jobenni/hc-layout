@@ -34,6 +34,7 @@ export async function readWorktrees(cwd, on) {
     return {
       path: lines.find((l) => l.startsWith("worktree "))?.slice(9) ?? "",
       branch: lines.find((l) => l.startsWith("branch "))?.slice(7).replace(/^refs\/heads\//, "") ?? null,
+      isFolderMissing: lines.some((l) => l.startsWith("prunable")),
     };
   });
 }
@@ -43,7 +44,7 @@ export async function readOpenIssues(cwd, on) {
   return JSON.parse(json);
 }
 
-const PR_FIELDS = "number,title,url,headRefName,state,isDraft,statusCheckRollup";
+const PR_FIELDS = "number,title,url,headRefName,headRefOid,state,isDraft,statusCheckRollup";
 
 async function readPullRequestOf(branch, cwd, on) {
   const json = await run("gh", ["pr", "list", "--state", "all", "--head", branch, "--limit", "1", "--json", PR_FIELDS], cwd, on);
@@ -105,4 +106,23 @@ export async function addWorktree(repoPath, path, branch, baseRef, on) {
     ? ["worktree", "add", path, branch]
     : ["worktree", "add", "-b", branch, path, baseRef];
   await run("git", args, repoPath, on);
+}
+
+export const isPullRequestFinished = (pr) => pr?.state === "MERGED" || pr?.state === "CLOSED";
+
+export async function hasUncommittedChanges(worktreePath, on) {
+  return Boolean((await run("git", ["--no-optional-locks", "status", "--porcelain"], worktreePath, on)).trim());
+}
+
+// Removes the worktree, then its branch: forced when it still points at the PR's head (a squash
+// merge leaves it unmerged in git's eyes), else only if git finds it merged. Returns why the branch
+// was kept, or null once it is deleted.
+export async function removeWorktreeAndBranch(repoPath, worktree, pr, on) {
+  if (worktree.isFolderMissing) await run("git", ["worktree", "prune"], repoPath, on);
+  else await run("git", ["worktree", "remove", worktree.path], repoPath, on);
+  const head = await exec("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${worktree.branch}`], { cwd: repoPath, on });
+  if (head.code !== 0) return null;
+  const isPullRequestHead = head.stdout.trim() === pr.headRefOid;
+  const deleted = await exec("git", ["branch", isPullRequestHead ? "-D" : "-d", worktree.branch], { cwd: repoPath, on });
+  return deleted.code === 0 ? null : "commits absents de la PR";
 }

@@ -1,9 +1,10 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, theme, window, layout, props, run, appHome, home, checking } from "herdr";
+import { spaces, panes, agents, terminals, focused, exec, readTextFile, theme, window, layout, props, run, appHome, home, checking } from "herdr";
 import {
   readWorktrees, readOpenIssues, readPullRequests, readViewerLogin, setSelfAssigned,
   issueBranchNumber, issueBranchName, checkSteps, checksSummary, defaultBaseRef, addWorktree,
+  isPullRequestFinished, hasUncommittedChanges, removeWorktreeAndBranch,
 } from "./github.js";
 
 const REFRESH_EVERY_MS = 30000;
@@ -20,6 +21,8 @@ const CLAUDE_VIA_LOGIN_SHELL = [
 ].join("\n");
 const OUTCOME_GLYPH = { success: "✓", failure: "✗", pending: "●", skipped: "○", none: "" };
 const PR_STATE_LABEL = { OPEN: "ouverte", MERGED: "fusionnée", CLOSED: "fermée" };
+const SPACE_CLOSE_WAIT_MS = 10000;
+const BUSY_AGENT_STATUSES = new Set(["working", "blocked"]);
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -32,9 +35,27 @@ function isInside(folder, root) {
   return Boolean(folder) && (folder === root || folder.startsWith(`${root}/`));
 }
 
+function isSpaceIn(space, folder) {
+  return isInside(space.folder, folder)
+    || space.tabs.some((tab) => panes().some((p) => p.tab === tab.id && isInside(p.cwd, folder)));
+}
+
 function spaceShowing(folder) {
-  return spaces().find((s) => isInside(s.folder, folder)
-    || s.tabs.some((tab) => panes().some((p) => p.tab === tab.id && isInside(p.cwd, folder))));
+  return spaces().find((s) => isSpaceIn(s, folder));
+}
+
+function spacesIn(folder, on) {
+  return spaces().filter((s) => (s.machine ?? null) === (on ?? null) && isSpaceIn(s, folder));
+}
+
+function terminalsOf(spaceList) {
+  const tabs = new Set(spaceList.flatMap((s) => s.tabs.map((tab) => tab.id)));
+  return panes().filter((p) => p.terminal && tabs.has(p.tab));
+}
+
+function busyAgentCount(spaceList) {
+  const inThoseSpaces = new Set(terminalsOf(spaceList).map((p) => p.pane));
+  return agents().filter((a) => inThoseSpaces.has(a.pane) && BUSY_AGENT_STATUSES.has(a.status)).length;
 }
 
 // Shown when this copy is a pane, or when its block is the active child of a visible stack.
@@ -107,7 +128,12 @@ export default class GhIssues extends View {
     this.viewer = null;
     this.issues = [];
     this.sessions = new Map();
+    this.linkedWorktrees = [];
     this.pullRequests = new Map();
+    this.uncommitted = new Set();
+    this.cleanupConfirming = null;
+    this.cleaningPath = null;
+    this.cleanupReport = "";
     this.expanded = null;
     this.launching = null;
     this.assigning = null;
@@ -138,20 +164,25 @@ export default class GhIssues extends View {
         const main = worktrees[0]?.path;
         const repoChanged = main !== this.repo?.main;
         this.repo = { main, name: main?.split("/").pop(), on };
-        this.sessions = new Map(worktrees.slice(1)
+        this.linkedWorktrees = worktrees.slice(1).filter((w) => w.branch);
+        this.sessions = new Map(this.linkedWorktrees
           .map((w) => [issueBranchNumber(w.branch), w])
           .filter(([number]) => number !== null));
+        if (repoChanged) { this.pullRequests = new Map(); this.cleanupConfirming = null; this.cleanupReport = ""; }
         if (withGithub || repoChanged) {
-          const branches = [branch, ...[...this.sessions.values()].map((s) => s.branch)];
+          // A merged or closed PR stays so: its branch is not asked again.
+          const finished = new Map([...this.pullRequests].filter(([, pr]) => isPullRequestFinished(pr)));
+          const branches = [branch, ...this.linkedWorktrees.map((w) => w.branch)].filter((b) => !finished.has(b));
           const [issues, pullRequests, viewer] = await Promise.all([
             readOpenIssues(main, on),
             readPullRequests(branches, main, on),
             this.viewer && !repoChanged ? this.viewer : readViewerLogin(main, on).catch(() => null),
           ]);
           this.issues = issues;
-          this.pullRequests = pullRequests;
+          this.pullRequests = new Map([...finished, ...pullRequests]);
           this.viewer = viewer;
         }
+        this.uncommitted = await this.findUncommitted(this.finishedWorktrees(), on);
         this.error = "";
       } catch (error) {
         this.error = String(error?.message ?? error);
@@ -232,6 +263,62 @@ export default class GhIssues extends View {
     else run("space.new", { folder: session.path, machine: this.repo?.on ?? "" });
   }
 
+  // Linked worktrees whose PR is merged or closed: what is left to clean up.
+  finishedWorktrees() {
+    return this.linkedWorktrees.filter((w) => isPullRequestFinished(this.pullRequests.get(w.branch)));
+  }
+
+  async findUncommitted(worktrees, on) {
+    const dirty = await Promise.all(worktrees.map((w) =>
+      w.isFolderMissing ? false : hasUncommittedChanges(w.path, on).catch(() => true)));
+    return new Set(worktrees.filter((_w, index) => dirty[index]).map((w) => w.path));
+  }
+
+  cleanableWorktrees() {
+    return this.finishedWorktrees().filter((w) => !this.uncommitted.has(w.path));
+  }
+
+  // Each worktree in turn: its spaces close (and their terminals end), then the worktree and its
+  // branch go. Changes made since the last refresh stop that one, not the others.
+  cleanUp(paths, cx) {
+    const { main, on } = this.repo ?? {};
+    const worktrees = this.cleanableWorktrees().filter((w) => paths.includes(w.path));
+    if (!main || !worktrees.length) return;
+    this.cleanupConfirming = null;
+    this.cleanupReport = "";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const removed = [], kept = [], failed = [];
+      for (const worktree of worktrees) {
+        this.cleaningPath = worktree.path;
+        cx.notify();
+        try {
+          if (!worktree.isFolderMissing && await hasUncommittedChanges(worktree.path, on)) throw new Error("modifications non commitées");
+          const closing = spacesIn(worktree.path, on);
+          const closingTerminals = new Set(terminalsOf(closing).map((p) => p.terminal));
+          for (const space of closing) run("space.close", { id: space.id, confirmed: true });
+          const deadline = Date.now() + SPACE_CLOSE_WAIT_MS;
+          while (terminals().some((k) => k.state === "live" && closingTerminals.has(k.address))) {
+            if (Date.now() >= deadline) throw new Error("les terminaux du space ne se sont pas arrêtés");
+            await cx.sleep(50);
+          }
+          const whyBranchKept = await removeWorktreeAndBranch(main, worktree, this.pullRequests.get(worktree.branch), on);
+          (whyBranchKept ? kept : removed).push(worktree.branch);
+        } catch (error) {
+          failed.push(`${worktree.branch} (${error?.message ?? error})`);
+        }
+      }
+      this.cleaningPath = null;
+      this.cleanupReport = [
+        removed.length && `${removed.length} nettoyé${removed.length > 1 ? "s" : ""}`,
+        kept.length && `branche gardée, commits absents de la PR : ${kept.join(", ")}`,
+        failed.length && `échec : ${failed.join(", ")}`,
+      ].filter(Boolean).join(" · ");
+      cx.notify();
+      this.refresh(cx, { withGithub: false });
+    });
+  }
+
   render(cx) {
     const here = location();
     if (here.cwd !== this.cwd) {
@@ -248,6 +335,7 @@ export default class GhIssues extends View {
       .when(Boolean(this.note), (el) => el.child(div().px(14).py(6).text_size(11).text_color(t.ansi1).child(this.note)))
       .child(div().flex_1().min_h(0).relative()
         .child(v_flex().id("gh-issues-list").absolute().inset_0().overflow_y_scroll().p(6).gap(2)
+          .when(this.finishedWorktrees().length > 0 || Boolean(this.cleanupReport), (el) => el.child(this.worktreesSection(t)))
           .children(issues.map((issue) => this.issueRow(issue, t)))
           .when(!issues.length, (el) => el.child(div().p(8).text_color(t.dim).child(this.emptyText()))))
         .child(Scrollbar.vertical("gh-issues-list").absolute().inset_0()));
@@ -367,6 +455,61 @@ export default class GhIssues extends View {
             ? div().w(12).flex_none().text_color(t.working).frames(["◐", "◓", "◑", "◒"], 160)
             : div().w(12).flex_none().text_color(this.outcomeColor(step.outcome, t)).child(OUTCOME_GLYPH[step.outcome]))
           .child(div().flex_1().min_w(0).truncate().text_size(12).child(step.name))));
+  }
+
+  worktreesSection(t) {
+    const finished = this.finishedWorktrees();
+    const cleanable = this.cleanableWorktrees();
+    const isCleaning = Boolean(this.cleaningPath);
+    return v_flex().flex_none().mb(6).p(6).gap(2).rounded(8).bg(t.surface).border_1().border_color(t.border)
+      .child(h_flex().h(26).px(4).gap(6).items_center()
+        .child(div().text_size(11).font_semibold().text_color(t.muted).child("Worktrees à nettoyer"))
+        .child(div().px(5).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).child(String(finished.length)))
+        .child(div().flex_1())
+        .when(cleanable.length > 1 && !isCleaning && !this.cleanupConfirming, (el) => el.child(
+          this.actionButton("worktrees-clean-all", `Nettoyer les ${cleanable.length}`, t, false,
+            (cx) => { this.cleanupConfirming = cleanable.map((w) => w.path); cx.notify(); }))))
+      .when(Boolean(this.cleanupConfirming), (el) => el.child(this.cleanupConfirmation(t)))
+      .children(finished.map((worktree) => this.worktreeRow(worktree, t)))
+      .when(Boolean(this.cleanupReport), (el) => el.child(div().px(4).py(2).text_size(11).text_color(t.muted).child(this.cleanupReport)));
+  }
+
+  worktreeRow(worktree, t) {
+    const pr = this.pullRequests.get(worktree.branch);
+    const look = pullRequestLook(pr, t);
+    const isDirty = this.uncommitted.has(worktree.path);
+    const isCleaning = this.cleaningPath === worktree.path;
+    const canOffer = !isDirty && !this.cleaningPath && !this.cleanupConfirming;
+    return h_flex().id(`worktree-${worktree.path}`).h(30).px(4).gap(6).items_center().rounded(6)
+      .child(svg(look.icon).size(13).flex_none().text_color(look.color))
+      .child(div().id(`worktree-pr-${worktree.path}`).flex_none().text_size(11).text_color(look.color).cursor_pointer()
+        .on_click((_e, cx) => openUrl(pr.url, cx)).child(`#${pr.number}`))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).child(worktree.branch))
+      .when(worktree.isFolderMissing, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child("dossier absent")))
+      .when(isDirty, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.ansi3).child("non commité")))
+      .when(isCleaning, (el) => el.child(div().flex_none().text_size(11).text_color(t.muted)
+        .child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90))))
+      .when(canOffer, (el) => el.child(div().id(`worktree-clean-${worktree.path}`).h(22).px(8).flex().flex_none().items_center()
+        .rounded(6).text_size(11).cursor_pointer().text_color(t.ansi5).bg(t.ansi5 + "1a").border_1().border_color(t.ansi5 + "55")
+        .on_click((_e, cx) => { this.cleanupConfirming = [worktree.path]; cx.notify(); })
+        .child("Nettoyer")));
+  }
+
+  cleanupConfirmation(t) {
+    const worktrees = this.cleanableWorktrees().filter((w) => this.cleanupConfirming.includes(w.path));
+    const closing = worktrees.flatMap((w) => spacesIn(w.path, this.repo?.on));
+    const busyAgents = busyAgentCount(closing);
+    const what = worktrees.length === 1 ? `le worktree et la branche ${worktrees[0].branch}` : `${worktrees.length} worktrees et leurs branches`;
+    return v_flex().p(8).gap(6).rounded(6).bg(t.background).border_1().border_color(t.ansi1 + "55").text_size(12)
+      .child(div().child(`Supprimer ${what} ?`))
+      .when(closing.length > 0, (el) => el.child(div().text_size(11).text_color(t.muted)
+        .child(`Space${closing.length > 1 ? "s" : ""} fermé${closing.length > 1 ? "s" : ""} : ${closing.map((s) => s.name).join(", ")}`)))
+      .when(busyAgents > 0, (el) => el.child(div().text_size(11).text_color(t.ansi1)
+        .child(`${busyAgents} agent${busyAgents > 1 ? "s" : ""} en cours ${busyAgents > 1 ? "seront arrêtés" : "sera arrêté"}`)))
+      .child(h_flex().gap(6)
+        .child(div().id("worktrees-clean-confirm").h(26).px(10).flex().items_center().rounded(6).cursor_pointer()
+          .bg(t.ansi1).text_color("#ffffff").on_click((_e, cx) => this.cleanUp(this.cleanupConfirming, cx)).child("Supprimer"))
+        .child(this.actionButton("worktrees-clean-cancel", "Annuler", t, false, (cx) => { this.cleanupConfirming = null; cx.notify(); })));
   }
 
   actionButton(id, label, t, isPrimary, onPress) {
