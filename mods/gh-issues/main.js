@@ -106,12 +106,6 @@ function pullRequestLook(pr, t) {
   return { icon: `${ICONS}/pr-open.svg`, color: t.ansi2 };
 }
 
-function readableTextOn(hexColor) {
-  const [r, g, b] = [0, 2, 4].map((i) => parseInt(hexColor.slice(i, i + 2), 16) / 255)
-    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.4 ? "#1f2328" : "#ffffff";
-}
-
 const initialsOf = (login) => login.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
 // The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
 // xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
@@ -134,7 +128,6 @@ export default class GhIssues extends View {
     this.cleanupConfirming = null;
     this.cleaningPath = null;
     this.cleanupReport = "";
-    this.expanded = null;
     this.launching = null;
     this.assigning = null;
     this.loading = false;
@@ -377,64 +370,70 @@ export default class GhIssues extends View {
       .child(this.pullRequestBlock(pr, t, "current"));
   }
 
-  assigneeBadges(assignees, t) {
-    return h_flex().flex_none().gap(2).children(assignees.slice(0, 3).map((a) =>
-      div().w(18).h(18).flex().items_center().justify_center().rounded_full().text_size(9).font_semibold()
-        .bg(a.login === this.viewer ? t.accent : t.raised)
-        .text_color(a.login === this.viewer ? t.accent_foreground : t.muted)
-        .child(initialsOf(a.login))))
-      .when(assignees.length > 3, (el) => el.child(div().text_size(10).text_color(t.dim).child(`+${assignees.length - 3}`)));
+  assigneeBadges(issue, t) {
+    const assignees = issue.assignees ?? [];
+    const isAssigning = this.assigning === issue.number;
+    const canAssignSelf = Boolean(this.viewer) && !this.isAssignedToViewer(issue);
+    return h_flex().flex_none().gap(2).items_center()
+      .children(assignees.slice(0, 3).map((a) => a.login === this.viewer
+        ? this.viewerBadge(issue, isAssigning, t)
+        : this.badge(t.raised, t.muted).id(`assignee-${issue.number}-${a.login}`).tooltip(a.login).child(initialsOf(a.login))))
+      .when(assignees.length > 3, (el) => el.child(div().text_size(10).text_color(t.dim).child(`+${assignees.length - 3}`)))
+      .when(canAssignSelf, (el) => el.child(this.badge(t.background, t.dim).id(`assign-${issue.number}`)
+        .border_1().border_color(t.border).cursor_pointer().tooltip("M'assigner")
+        .hover((s) => s.text_color(t.foreground).border_color(t.accent))
+        .on_click((_e, cx) => { if (!isAssigning) this.toggleSelfAssigned(issue, cx); })
+        .child(isAssigning ? "…" : "+")));
+  }
+
+  viewerBadge(issue, isAssigning, t) {
+    return this.badge(t.accent, t.accent_foreground).id(`unassign-${issue.number}`).cursor_pointer().tooltip("Me retirer")
+      .hover((s) => s.bg(t.ansi1).text_color("#ffffff"))
+      .on_click((_e, cx) => { if (!isAssigning) this.toggleSelfAssigned(issue, cx); })
+      .child(isAssigning ? "…" : initialsOf(this.viewer));
+  }
+
+  badge(background, color) {
+    return div().w(18).h(18).flex().flex_none().items_center().justify_center().rounded_full().text_size(9).font_semibold()
+      .bg(background).text_color(color);
+  }
+
+  claudeButton(issue, session, t) {
+    const isLaunching = this.launching === issue.number;
+    return div().id(`claude-${issue.number}`).w(22).h(22).flex().flex_none().items_center().justify_center().rounded(6)
+      .cursor_pointer().hover((s) => s.bg(t.raised))
+      .tooltip(session ? "Ouvrir la session" : isLaunching ? "Création du worktree…" : "Lancer Claude")
+      .on_click((_e, cx) => {
+        if (session) this.openSession(session);
+        else if (!isLaunching) this.launch(issue, cx);
+      })
+      .child(isLaunching
+        ? div().text_size(11).text_color(t.muted).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)
+        : svg(`${ICONS}/claude.svg`).size(14).text_color("#D97757"));
   }
 
   issueRow(issue, t) {
     const session = this.sessions.get(issue.number);
     const pr = session ? this.pullRequests.get(session.branch) : null;
     const summary = pr ? checksSummary(checkSteps(pr)) : "none";
-    const isExpanded = this.expanded === issue.number;
-    const assignees = issue.assignees ?? [];
-    return v_flex().flex_none().rounded(7).when(isExpanded, (el) => el.bg(t.selected))
-      .child(h_flex().id(`issue-${issue.number}`).h(30).px(8).gap(8).items_center().rounded(7).cursor_pointer()
-        .hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => { this.expanded = isExpanded ? null : issue.number; cx.notify(); })
-        .child(svg(`${ICONS}/issue.svg`).size(14).flex_none().text_color(t.ansi2))
-        .child(div().w(40).flex_none().text_size(11).text_color(t.dim).child(`#${issue.number}`))
-        .child(div().flex_1().min_w(0).truncate().child(issue.title))
-        .when(Boolean(session), (el) => el.child(div().flex_none().px(5).py(1).rounded(4).text_size(10)
-          .bg(t.raised).text_color(t.muted).child("session")))
-        .when(Boolean(pr), (el) => {
-          const look = pullRequestLook(pr, t);
-          return el.child(h_flex().flex_none().gap(3).items_center().text_size(11)
-            .child(svg(look.icon).size(13).text_color(look.color))
-            .child(div().text_color(this.outcomeColor(summary, t)).child(`#${pr.number} ${OUTCOME_GLYPH[summary]}`)));
-        })
-        .when(assignees.length > 0, (el) => el.child(this.assigneeBadges(assignees, t))))
-      .when(isExpanded, (el) => el.child(this.issueDetails(issue, session, pr, t)));
-  }
-
-  issueDetails(issue, session, pr, t) {
-    const isLaunching = this.launching === issue.number;
-    const isAssigning = this.assigning === issue.number;
-    const isMine = this.isAssignedToViewer(issue);
-    const assignees = issue.assignees ?? [];
-    return v_flex().px(8).pb(8).gap(8)
-      .when(issue.labels?.length > 0, (el) => el.child(h_flex().gap(4).flex_wrap().children(issue.labels.map((label) =>
-        div().px(7).py(1).rounded(10).text_size(10).font_semibold().bg(`#${label.color}`).text_color(readableTextOn(label.color)).child(label.name)))))
-      .child(h_flex().gap(6).items_center().text_size(11)
-        .child(div().text_color(t.muted).child("Assignée à"))
-        .child(div().flex_1().min_w(0).truncate().text_color(assignees.length ? t.foreground : t.dim)
-          .child(assignees.length ? assignees.map((a) => a.login).join(", ") : "personne"))
-        .when(Boolean(this.viewer), (el) => el.child(this.actionButton(`assign-${issue.number}`,
-          isAssigning ? "…" : isMine ? "Me retirer" : "M'assigner", t, false,
-          (cx) => { if (!isAssigning) this.toggleSelfAssigned(issue, cx); }))))
-      .child(h_flex().gap(6)
-        .child(session
-          ? this.actionButton(`open-session-${issue.number}`, "Ouvrir la session", t, true, () => this.openSession(session))
-          : this.actionButton(`launch-${issue.number}`, isLaunching ? "Création du worktree…" : "Lancer Claude", t, !isLaunching,
-            (cx) => { if (!isLaunching) this.launch(issue, cx); }))
-        .child(this.actionButton(`github-${issue.number}`, "Voir sur GitHub", t, false, (cx) => openUrl(issue.url, cx))))
-      .when(Boolean(session), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(session.branch)))
-      .when(Boolean(pr), (el) => el.child(this.pullRequestBlock(pr, t, `issue-${issue.number}`)))
-      .when(Boolean(session) && !pr, (el) => el.child(div().text_size(11).text_color(t.dim).child("Pas encore de PR pour cette branche")));
+    return h_flex().id(`issue-${issue.number}`).flex_none().h(30).px(8).gap(8).items_center().rounded(7)
+      .hover((s) => s.bg(t.hover))
+      .child(svg(`${ICONS}/issue.svg`).size(14).flex_none().text_color(t.ansi2))
+      .child(div().id(`issue-link-${issue.number}`).w(40).flex_none().text_size(11).text_color(t.dim).cursor_pointer()
+        .hover((s) => s.text_color(t.accent)).tooltip("Voir sur GitHub")
+        .on_click((_e, cx) => openUrl(issue.url, cx)).child(`#${issue.number}`))
+      .child(div().flex_1().min_w(0).truncate().child(issue.title))
+      .when(Boolean(session), (el) => el.child(div().flex_none().px(5).py(1).rounded(4).text_size(10)
+        .bg(t.raised).text_color(t.muted).child("session")))
+      .when(Boolean(pr), (el) => {
+        const look = pullRequestLook(pr, t);
+        return el.child(h_flex().id(`issue-pr-${issue.number}`).flex_none().gap(3).items_center().text_size(11).cursor_pointer()
+          .on_click((_e, cx) => openUrl(pr.url, cx))
+          .child(svg(look.icon).size(13).text_color(look.color))
+          .child(div().text_color(this.outcomeColor(summary, t)).child(`#${pr.number} ${OUTCOME_GLYPH[summary]}`)));
+      })
+      .child(this.assigneeBadges(issue, t))
+      .child(this.claudeButton(issue, session, t));
   }
 
   pullRequestBlock(pr, t, scope) {
