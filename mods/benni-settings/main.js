@@ -38,13 +38,30 @@ const SECTIONS = [
   { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
 ];
 
+// install.sh replaces this mod, and Herdr's reload kills the children of its exec: the install runs detached
+// and logs to <appHome>/hc-layout-install.log, between an "install-start <epoch s>" and an "install-exit <code>" line.
 const INSTALL_FROM_GITHUB = [
-  'set -e',
+  'echo "install-start $(date +%s)"',
   'source=$(mktemp -d)',
-  'trap \'rm -rf "$source"\' EXIT',
+  'trap \'status=$?; rm -rf "$source"; echo "install-exit $status"\' EXIT',
+  'set -e',
   'git clone --depth 1 --quiet --branch "$2" "$1" "$source"',
   'HERDR_APP_HOME="$3" bash "$source/install.sh"',
 ].join("\n");
+const START_DETACHED = 'nohup bash -c "$0" bash "$@" >"$3/hc-layout-install.log" 2>&1 </dev/null &';
+const INSTALL_POLL_INTERVAL = 1000;
+const INSTALL_GIVE_UP_AFTER = 10 * 60;
+
+const installLogPath = () => `${appHome()}/hc-layout-install.log`;
+
+function parseInstallLog(text) {
+  const startedAt = Number(/^install-start (\d+)$/m.exec(text ?? "")?.[1] ?? 0);
+  const exitMatch = /^install-exit (\d+)$/m.exec(text ?? "");
+  const lastLines = (text ?? "").replace(/\x1b\[[0-9;]*m/g, "").split("\n")
+    .filter((line) => line && !line.startsWith("install-")).slice(-4).join("\n");
+  const running = !exitMatch && Date.now() / 1000 - startedAt < INSTALL_GIVE_UP_AFTER;
+  return { running, exitCode: exitMatch ? Number(exitMatch[1]) : null, lastLines };
+}
 
 const shortCommit = (commit) => commit ? commit.slice(0, 7) : "inconnue";
 
@@ -80,7 +97,19 @@ export default class Settings extends View {
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
     this.update = { phase: "checking", branch: chosenBranch(), installed: null, latest: null, error: "" };
     this.handle.focus();
-    if (!checking()) this.checkForUpdate(cx);
+    if (checking()) return;
+    this.checkForUpdate(cx);
+    this.resumeRunningInstall(cx);
+  }
+
+  // After the install reloads this mod, the new dialog picks up where the old one was.
+  resumeRunningInstall(cx) {
+    cx.spawn(async (cx) => {
+      if (!parseInstallLog(await readTextFile(installLogPath())).running) return;
+      this.update = { ...this.update, phase: "installing", error: "" };
+      this.followInstall(cx);
+      cx.notify();
+    });
   }
 
   // phase: checking, current, outdated, unknown (no record of the installed commit), error, installing, failed.
@@ -108,15 +137,32 @@ export default class Settings extends View {
     this.update = { ...this.update, phase: "installing", error: "" };
     cx.notify();
     cx.spawn(async (cx) => {
-      const result = await exec("bash", ["-c", INSTALL_FROM_GITHUB, "bash", LAYOUT_REPO, this.update.branch, appHome()], { timeout: 300000 })
+      const result = await exec("bash", ["-c", START_DETACHED, INSTALL_FROM_GITHUB, LAYOUT_REPO, this.update.branch, appHome()])
         .catch((error) => ({ code: -1, stdout: "", stderr: String(error?.message ?? error) }));
-      if (result.code === 0) {
-        notify({ title: "Layout mis à jour", body: `Version ${shortCommit(this.update.latest)} installée.`, level: "success" });
-        this.update = { ...this.update, phase: "current", installed: this.update.latest };
-        setShared(UPDATE_KEY, { installed: this.update.latest, latest: this.update.latest });
+      if (result.code === 0) this.followInstall(cx);
+      else this.update = { ...this.update, phase: "failed", error: result.stderr.trim() || `lancement impossible (code ${result.code})` };
+      cx.notify();
+    });
+  }
+
+  followInstall(cx) {
+    this.installPoll?.cancel();
+    this.installPoll = cx.timer.every(INSTALL_POLL_INTERVAL, (cx) => this.checkInstallLog(cx));
+  }
+
+  checkInstallLog(cx) {
+    cx.spawn(async (cx) => {
+      const run = parseInstallLog(await readTextFile(installLogPath()));
+      if (run.running || !this.installPoll) return;
+      this.installPoll.cancel();
+      this.installPoll = null;
+      if (run.exitCode === 0) {
+        const installed = await readInstalledCommit();
+        notify({ title: "Layout mis à jour", body: `Version ${shortCommit(installed)} installée.`, level: "success" });
+        this.checkForUpdate(cx);
       } else {
-        const lastLines = (result.stderr || result.stdout).trim().split("\n").slice(-4).join("\n");
-        this.update = { ...this.update, phase: "failed", error: lastLines || `install.sh a échoué (code ${result.code})` };
+        const reason = run.exitCode === null ? "l'installation s'est arrêtée sans finir" : `install.sh a échoué (code ${run.exitCode})`;
+        this.update = { ...this.update, phase: "failed", error: run.lastLines || reason };
       }
       cx.notify();
     });
@@ -293,7 +339,7 @@ export default class Settings extends View {
     const canInstall = ["outdated", "unknown", "failed"].includes(phase);
     const canCheck = ["current", "error", "unknown", "outdated", "failed"].includes(phase);
     return v_flex().gap(14)
-      .child(h_flex().gap(8)
+      .child(h_flex().gap(8).items_stretch()
         .child(this.channelChoice("stable", "Stable", "Les fonctionnalités terminées.", t))
         .child(this.channelChoice("canary", "Canary", "Les modifications en cours, dès qu'elles sont poussées. Peut casser.", t)))
       .child(div().w_full().text_size(11.5).text_color(t.muted)
