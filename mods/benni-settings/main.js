@@ -9,19 +9,25 @@ import { spaces, props, closeOverlay, theme, shared, setShared, exec, readTextFi
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
+// The channel (shared("benni.channel")) picks the branch: Stable follows main, Canary the work in progress.
 const LAYOUT_REPO = "https://github.com/jobenni/hc-layout.git";
-const LAYOUT_BRANCH = "main";
 const UPDATE_KEY = "benni.update";
+const CHANNEL_KEY = "benni.channel";
+const CHANNEL_BRANCHES = { stable: "main", canary: "canary" };
+
+const chosenChannel = () => (shared(CHANNEL_KEY) === "canary" ? "canary" : "stable");
+const chosenBranch = () => CHANNEL_BRANCHES[chosenChannel()];
 
 async function readInstalledCommit() {
   const text = await readTextFile(`${appHome()}/hc-layout.json`);
   try { return JSON.parse(text ?? "")?.commit || null; } catch { return null; }
 }
 
-async function readLatestCommit() {
-  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${LAYOUT_BRANCH}`], { timeout: 20000 });
-  const commit = result.code === 0 ? result.stdout.split(/\s/)[0] : "";
-  if (!commit) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+async function readLatestCommit(branch) {
+  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${branch}`], { timeout: 20000 });
+  if (result.code !== 0) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+  const commit = result.stdout.split(/\s/)[0];
+  if (!commit) throw new Error(`la branche ${branch} n'existe pas sur GitHub`);
   return commit;
 }
 
@@ -72,22 +78,26 @@ export default class Settings extends View {
     this.addInput.on("submit", (_e, cx) => this.addWorkspace(cx));
     this.renameInput = InputState.new({});
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
-    this.update = { phase: "checking", installed: null, latest: null, error: "" };
+    this.update = { phase: "checking", branch: chosenBranch(), installed: null, latest: null, error: "" };
     this.handle.focus();
     if (!checking()) this.checkForUpdate(cx);
   }
 
   // phase: checking, current, outdated, unknown (no record of the installed commit), error, installing, failed.
   checkForUpdate(cx) {
-    this.update = { ...this.update, phase: "checking", error: "" };
+    const branch = chosenBranch();
+    this.update = { ...this.update, phase: "checking", branch, latest: null, error: "" };
     cx.spawn(async (cx) => {
       try {
-        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit()]);
+        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit(branch)]);
+        if (branch !== chosenBranch()) return;
         const phase = !installed ? "unknown" : installed === latest ? "current" : "outdated";
-        this.update = { phase, installed, latest, error: "" };
+        this.update = { phase, branch, installed, latest, error: "" };
         setShared(UPDATE_KEY, { installed, latest });
       } catch (error) {
+        if (branch !== chosenBranch()) return;
         this.update = { ...this.update, phase: "error", error: String(error?.message ?? error) };
+        setShared(UPDATE_KEY, null);
       }
       cx.notify();
     });
@@ -98,7 +108,7 @@ export default class Settings extends View {
     this.update = { ...this.update, phase: "installing", error: "" };
     cx.notify();
     cx.spawn(async (cx) => {
-      const result = await exec("bash", ["-c", INSTALL_FROM_GITHUB, "bash", LAYOUT_REPO, LAYOUT_BRANCH, appHome()], { timeout: 300000 })
+      const result = await exec("bash", ["-c", INSTALL_FROM_GITHUB, "bash", LAYOUT_REPO, this.update.branch, appHome()], { timeout: 300000 })
         .catch((error) => ({ code: -1, stdout: "", stderr: String(error?.message ?? error) }));
       if (result.code === 0) {
         notify({ title: "Layout mis à jour", body: `Version ${shortCommit(this.update.latest)} installée.`, level: "success" });
@@ -110,6 +120,13 @@ export default class Settings extends View {
       }
       cx.notify();
     });
+  }
+
+  chooseChannel(channel, cx) {
+    if (channel === chosenChannel() || this.update.phase === "installing") return;
+    setShared(CHANNEL_KEY, channel);
+    this.checkForUpdate(cx);
+    cx.notify();
   }
 
   addWorkspace(cx) {
@@ -249,8 +266,21 @@ export default class Settings extends View {
         .child(this.textButton("ws-add", "Ajouter", true, t, (_e, cx) => this.addWorkspace(cx))));
   }
 
+  channelChoice(channel, title, detail, t) {
+    const chosen = chosenChannel() === channel;
+    const locked = this.update.phase === "installing";
+    return v_flex().id(`channel-${channel}`).flex_1().min_w(0).gap(3).p(10).rounded(8).border_1()
+      .border_color(chosen ? t.accent : t.border).bg(chosen ? t.selected : t.surface)
+      .when(!chosen && !locked, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.chooseChannel(channel, cx)))
+      .when(locked && !chosen, (el) => el.opacity(0.5))
+      .child(h_flex().gap(6).items_center()
+        .child(div().text_size(13).font_medium().text_color(t.foreground).child(title))
+        .child(div().text_size(11).text_color(t.dim).child(CHANNEL_BRANCHES[channel])))
+      .child(div().w_full().text_size(11.5).text_color(t.muted).child(detail));
+  }
+
   updateSection(t) {
-    const { phase, installed, latest, error } = this.update;
+    const { phase, branch, installed, latest, error } = this.update;
     const status = {
       checking: ["Recherche d'une nouvelle version…", t.muted],
       current: ["Le layout est à jour.", t.foreground],
@@ -263,8 +293,11 @@ export default class Settings extends View {
     const canInstall = ["outdated", "unknown", "failed"].includes(phase);
     const canCheck = ["current", "error", "unknown", "outdated", "failed"].includes(phase);
     return v_flex().gap(14)
+      .child(h_flex().gap(8)
+        .child(this.channelChoice("stable", "Stable", "Les fonctionnalités terminées.", t))
+        .child(this.channelChoice("canary", "Canary", "Les modifications en cours, dès qu'elles sont poussées. Peut casser.", t)))
       .child(div().w_full().text_size(11.5).text_color(t.muted)
-        .child(`Compare le layout installé à la branche ${LAYOUT_BRANCH} de ${LAYOUT_REPO.replace("https://", "")}. La mise à jour remplace le layout et ses mods ; les anciennes versions sont gardées dans backups/.`))
+        .child(`Compare le layout installé à la branche ${branch} de ${LAYOUT_REPO.replace("https://", "")}. La mise à jour remplace le layout et ses mods ; les anciennes versions sont gardées dans backups/.`))
       .child(v_flex().gap(4).p(12).rounded(8).border_1().border_color(t.border).bg(t.surface)
         .child(div().text_size(13).font_medium().text_color(status[1]).child(status[0]))
         .child(div().text_size(11.5).text_color(t.dim).child(`Installée : ${shortCommit(installed)} · Dernière : ${shortCommit(latest)}`)))

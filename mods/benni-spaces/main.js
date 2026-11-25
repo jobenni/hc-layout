@@ -9,19 +9,25 @@ import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOve
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
+// The channel (shared("benni.channel")) picks the branch: Stable follows main, Canary the work in progress.
 const LAYOUT_REPO = "https://github.com/jobenni/hc-layout.git";
-const LAYOUT_BRANCH = "main";
 const UPDATE_KEY = "benni.update";
+const CHANNEL_KEY = "benni.channel";
+const CHANNEL_BRANCHES = { stable: "main", canary: "canary" };
+
+const chosenChannel = () => (shared(CHANNEL_KEY) === "canary" ? "canary" : "stable");
+const chosenBranch = () => CHANNEL_BRANCHES[chosenChannel()];
 
 async function readInstalledCommit() {
   const text = await readTextFile(`${appHome()}/hc-layout.json`);
   try { return JSON.parse(text ?? "")?.commit || null; } catch { return null; }
 }
 
-async function readLatestCommit() {
-  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${LAYOUT_BRANCH}`], { timeout: 20000 });
-  const commit = result.code === 0 ? result.stdout.split(/\s/)[0] : "";
-  if (!commit) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+async function readLatestCommit(branch) {
+  const result = await exec("git", ["ls-remote", LAYOUT_REPO, `refs/heads/${branch}`], { timeout: 20000 });
+  if (result.code !== 0) throw new Error(result.stderr.trim() || "GitHub ne répond pas");
+  const commit = result.stdout.split(/\s/)[0];
+  if (!commit) throw new Error(`la branche ${branch} n'existe pas sur GitHub`);
   return commit;
 }
 const UPDATE_FIRST_CHECK_DELAY = 15000;
@@ -327,7 +333,7 @@ export default class Spaces extends View {
   checkLayoutUpdate(cx) {
     cx.spawn(async () => {
       try {
-        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit()]);
+        const [installed, latest] = await Promise.all([readInstalledCommit(), readLatestCommit(chosenBranch())]);
         setShared(UPDATE_KEY, { installed, latest });
         if (!installed || installed === latest || localStorage.getItem("update.notified") === latest) return;
         localStorage.setItem("update.notified", latest);

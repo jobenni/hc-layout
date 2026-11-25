@@ -8,6 +8,10 @@ Le Herdr qui tourne charge les mods depuis `~/.config/herdr-app/mods/<mod>/`, pa
 2. Sauvegarde le fichier live en `<fichier>.bak-<sujet>-<AAAAMMJJ>` à côté de lui.
 3. Copie le fichier, puis vérifie avec `diff -q` qu'il est identique à celui du dépôt.
 
+## Branches et canaux
+
+Réglages › Mise à jour propose deux canaux : **Stable** suit `main` (fonctionnalités terminées), **Canary** suit `canary` (travail en cours). Développe et pousse sur `canary` ; quand Johan dit de déployer, le skill `deploy` squashe `canary` dans `main` puis réaligne `canary` sur `main`.
+
 ## Messages de commit
 
 Suis [Conventional Commits](https://www.conventionalcommits.org/fr/v1.0.0/) : `<type>(<portée>): <description>`, en anglais, à l'impératif.
