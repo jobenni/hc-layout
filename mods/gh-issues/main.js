@@ -9,6 +9,15 @@ import {
 const REFRESH_EVERY_MS = 30000;
 const ICONS = "mods/gh-issues/icons";
 const PROMPT_DRAFT_PLUGIN = `${appHome()}/mods/gh-issues/claude-draft`;
+// Through the user's own shell, so a `claude` function or alias in their rc file
+// (e.g. one picking a Claude profile from the folder) applies.
+const CLAUDE_VIA_LOGIN_SHELL = [
+  'case "${SHELL##*/}" in',
+  '  fish) exec "$SHELL" -c \'claude $argv\' -- "$@" ;;',
+  '  bash|zsh) exec "$SHELL" -ic \'claude "$@"\' claude "$@" ;;',
+  "esac",
+  'exec claude "$@"',
+].join("\n");
 const OUTCOME_GLYPH = { success: "✓", failure: "✗", pending: "●", skipped: "○", none: "" };
 const PR_STATE_LABEL = { OPEN: "ouverte", MERGED: "fusionnée", CLOSED: "fermée" };
 
@@ -171,7 +180,7 @@ export default class GhIssues extends View {
           folder: path,
           machine: on ?? "",
           tab: `#${issue.number}`,
-          argv: ["env", `CLAUDE_PROMPT_DRAFT=Traite l'issue ${issue.url}`, "claude", "--plugin-dir", pluginDir],
+          argv: ["env", `CLAUDE_PROMPT_DRAFT=Traite l'issue ${issue.url}`, "sh", "-c", CLAUDE_VIA_LOGIN_SHELL, "sh", "--plugin-dir", pluginDir],
         });
       } catch (error) {
         this.note = `Lancement impossible : ${error?.message ?? error}`;
