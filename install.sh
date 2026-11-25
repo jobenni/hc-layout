@@ -6,7 +6,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/jobenni/hc-layout.git"
 LAYOUT_NAME="benni"
-MODS=(benni-spaces benni-settings tabs-graph gh-issues git-graph)
+MODS=(benni-spaces benni-settings benni-toast tabs-graph gh-issues git-graph)
 
 APP_HOME="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
 BACKUP_DIR="$APP_HOME/backups/hc-layout-$(date +%Y%m%d-%H%M%S)"
