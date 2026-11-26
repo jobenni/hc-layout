@@ -53,7 +53,14 @@ export class RoutinesScreen {
     this.keepInput = InputState.new({ placeholder: String(DEFAULT_KEPT_RUNS) });
     for (const input of [this.everyInput, this.minuteInput, this.cronInput]) input.on("change", (_e, cx) => cx.notify());
     this.effortSlider = SliderState.new({ min: 0, max: EFFORTS.length - 1, step: 1 });
-    this.effortSlider.on("change", (_value, cx) => cx.notify());
+    // The slider moves by whole levels: a drag between two stops snaps to the nearest.
+    const snapEffort = (value, cx) => {
+      const level = Math.round(Number(value));
+      if (level !== value) this.effortSlider.set_value(level);
+      cx.notify();
+    };
+    this.effortSlider.on("change", snapEffort);
+    this.effortSlider.on("release", snapEffort);
     this.modelMenu = { open: false, highlighted: 0, trigger: cx.focus_handle(), list: cx.focus_handle() };
     if (checking()) return;
     cx.timer.every(LAYOUT_CHECK_MS, () => this.closeWhenColumnMoved());
@@ -657,6 +664,13 @@ export class RoutinesScreen {
   openModelMenu(draft) {
     this.modelMenu.open = true;
     this.modelMenu.highlighted = Math.max(0, MODELS.findIndex((m) => m.id === draft.model));
+    this.modelMenu.list.focus();
+  }
+
+  toggleModelMenu(draft, cx) {
+    if (this.modelMenu.open) this.closeModelMenu();
+    else this.openModelMenu(draft);
+    cx.notify();
   }
 
   closeModelMenu() {
@@ -686,6 +700,7 @@ export class RoutinesScreen {
     const chosen = MODELS.find((m) => m.id === draft.model);
     const trigger = h_flex().id("editor-model-trigger").h(30).w(170).px(10).gap(8).items_center().rounded(7).border_1()
       .border_color(menu.open ? t.accent : t.input).bg(t.background).cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => { cx.stop_propagation(); this.toggleModelMenu(draft, cx); })
       .child(div().flex_1().text_size(12.5).text_color(chosen ? t.foreground : t.dim).child(chosen?.label ?? draft.model ?? "Choisir"))
       .child(svg(CHEVRON_DOWN).size(12).text_color(t.dim));
     const list = v_flex().id("editor-model-list").role("list_box").track_focus(menu.list).on_key_down((e, cx) => this.onModelMenuKey(draft, e, cx))
