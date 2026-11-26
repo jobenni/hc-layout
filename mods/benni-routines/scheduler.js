@@ -1,7 +1,7 @@
 import { div } from "gpui-kit";
 import { notify, openOverlay, closeOverlay, nextCommand, checking, layout, settings, shared, setShared, machines, exec } from "herdr";
 import { readStore, readAllStores, changeRuns, newId, syncStore, storeState, clockOf, readUtcOffset, publishUtcOffset } from "./store.js";
-import { parseCron, scheduleCron, cronMatches, occurrencesBetween, startOfMinute } from "./schedule.js";
+import { compileSchedule, startOfMinute } from "./schedule.js";
 import { startRun, followRunningRuns, purgeOldRuns } from "./runs.js";
 import { machineKey, machineOfKey, machineAppDir } from "./machine-files.js";
 
@@ -155,7 +155,7 @@ export class RoutineScheduler {
       // Nothing is missed before the routine was last turned on or saved.
       const from = machineClock.toWall(startOfMinute(Math.max(lastTick, routine.armedAt ?? 0)));
       let missed;
-      try { missed = occurrencesBetween(parseCron(scheduleCron(routine.schedule)), from, to, MAX_MISSED_COUNTED); } catch { continue; }
+      try { missed = compileSchedule(routine.schedule).between(from, to, MAX_MISSED_COUNTED); } catch { continue; }
       const times = missed.map((wall) => machineClock.toTime(wall)).filter((time) => !claims.has(runClaim(routine.id, time)));
       if (!times.length) continue;
       const last = times[times.length - 1];
@@ -187,9 +187,9 @@ export class RoutineScheduler {
         const wall = machineClock.toWall(now);
         for (const routine of store.routines) {
           if (!routine.enabled || routine.armedAt === minute || state.fired.get(routine.id) === minute) continue;
-          let cron;
-          try { cron = parseCron(scheduleCron(routine.schedule)); } catch { continue; }
-          if (!cronMatches(cron, wall)) continue;
+          let schedule;
+          try { schedule = compileSchedule(routine.schedule); } catch { continue; }
+          if (!schedule.matches(wall)) continue;
           state.fired.set(routine.id, minute);
           try {
             if (await claim(machine, runClaim(routine.id, now))) await this.launch(machine, routine);

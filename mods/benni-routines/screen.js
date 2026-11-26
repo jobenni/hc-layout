@@ -1,8 +1,8 @@
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Select, Popup, SliderState, Slider, SliderTrack, SliderIndicator, SliderThumb } from "gpui-base";
 import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, machines } from "herdr";
 import { readStore, readAllStores, changeRoutines, changeRuns, syncStore, storeState, clockOf, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
-import { PRESETS, WEEKDAYS, describeSchedule, scheduleError, scheduleCron, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
+import { PRESETS, WEEKDAYS, INTERVAL_MAX_MINUTES, describeSchedule, scheduleError, normalizeSchedule, timesOf, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
 import { startRun, purgeOldRuns, focusRunTab, resumeInTab, closeRunTab, cleanWorktree, removeRunFiles } from "./runs.js";
 import { workColumnBounds, runToShow } from "./scheduler.js";
 
@@ -11,10 +11,17 @@ const CLOCK = "mods/workspace-chrome/clock.svg";
 const CLOSE = "mods/pane/close.svg";
 const BRANCH = "mods/workspace-chrome/git-branch.svg";
 const TRASH = "mods/workspace-chrome/x.svg";
+const CHEVRON_DOWN = "mods/workspace-chrome/chevron-down.svg";
+const CHECK = "mods/workspace-chrome/check.svg";
+const PLUS = "mods/workspace-chrome/plus.svg";
+const EFFORT_LABEL_WIDTH = 52;
+const EFFORT_THUMB = 16;
+const EFFORT_GROOVE = 6;
 const LIST_WIDTH = 340;
 const LAYOUT_CHECK_MS = 1000;
 const STATUS_LABEL = { running: "En cours", done: "Terminé", failed: "Échec", missed: "Manqué" };
 
+const effortColor = (t, effort) => ({ low: t.ansi4, medium: t.ansi6, high: t.ansi2, xhigh: t.ansi3, max: t.ansi1 }[effort] ?? t.dim);
 const statusColor = (t, status) => ({ running: t.working, done: t.ansi2, failed: t.ansi1, missed: t.dim }[status] ?? t.dim);
 const firstLine = (text) => (text ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
 
@@ -38,12 +45,16 @@ export class RoutinesScreen {
     this.nameInput = InputState.new({ placeholder: "Revue des dépendances" });
     this.descriptionInput = InputState.new({ placeholder: "Ce que fait la routine (facultatif)" });
     this.promptInput = TextareaState.new({ placeholder: "Le message envoyé à Claude à chaque run", rows: 7 });
-    this.timeInput = InputState.new({ placeholder: "09:00" });
+    this.timeInputs = [];
+    this.everyInput = InputState.new({ placeholder: "30" });
     this.minuteInput = InputState.new({ placeholder: "0" });
     this.cronInput = InputState.new({ placeholder: "*/15 9-18 * * 1-5" });
     this.folderInput = InputState.new({ placeholder: "/chemin/du/projet" });
     this.keepInput = InputState.new({ placeholder: String(DEFAULT_KEPT_RUNS) });
-    for (const input of [this.timeInput, this.minuteInput, this.cronInput]) input.on("change", (_e, cx) => cx.notify());
+    for (const input of [this.everyInput, this.minuteInput, this.cronInput]) input.on("change", (_e, cx) => cx.notify());
+    this.effortSlider = SliderState.new({ min: 0, max: EFFORTS.length - 1, step: 1 });
+    this.effortSlider.on("change", (_value, cx) => cx.notify());
+    this.modelMenu = { open: false, highlighted: 0, trigger: cx.focus_handle(), list: cx.focus_handle() };
     if (checking()) return;
     cx.timer.every(LAYOUT_CHECK_MS, () => this.closeWhenColumnMoved());
     // Shown copies of this mod all hear its commands: the scheduler opens the screen, the screen
@@ -124,7 +135,9 @@ export class RoutinesScreen {
   onKey(event, cx) {
     if (event.key !== "escape") return;
     cx.stop_propagation();
-    if (this.confirmingRunDelete || this.confirmingRoutineDelete) {
+    if (this.modelMenu.open) {
+      this.closeModelMenu();
+    } else if (this.confirmingRunDelete || this.confirmingRoutineDelete) {
       this.confirmingRunDelete = null;
       this.confirmingRoutineDelete = false;
     } else if (this.editing) {
@@ -147,7 +160,10 @@ export class RoutinesScreen {
     this.nameInput.set_value(draft.name);
     this.descriptionInput.set_value(draft.description);
     this.promptInput.set_value(draft.prompt);
-    this.timeInput.set_value(draft.schedule.time ?? "09:00");
+    this.showTimes(timesOf(draft.schedule).map((time) => time ?? "09:00"));
+    this.everyInput.set_value(String(draft.schedule.every ?? 30));
+    this.effortSlider.set_value(Math.max(0, EFFORTS.findIndex((e) => e.id === (draft.effort ?? ""))));
+    this.modelMenu.open = false;
     this.minuteInput.set_value(String(draft.schedule.minute ?? 0));
     this.cronInput.set_value(draft.schedule.cron ?? "");
     this.folderInput.set_value(draft.folder);
@@ -156,11 +172,47 @@ export class RoutinesScreen {
     cx.notify();
   }
 
+  // One field per time; the fields are kept and reused, since an InputState is made outside render.
+  showTimes(times) {
+    while (this.timeInputs.length < times.length) {
+      const input = InputState.new({ placeholder: "09:00" });
+      input.on("change", (_e, cx) => cx.notify());
+      this.timeInputs.push(input);
+    }
+    this.timeInputs.length = times.length;
+    times.forEach((time, index) => this.timeInputs[index].set_value(time));
+  }
+
+  draftTimes() {
+    return this.timeInputs.map((input) => input.value().trim());
+  }
+
+  addTime(cx) {
+    const times = this.draftTimes();
+    const last = /^(\d{1,2}):(\d{2})$/.exec(times[times.length - 1] ?? "");
+    const next = last ? `${String((Number(last[1]) + 1) % 24).padStart(2, "0")}:${last[2]}` : "09:00";
+    this.showTimes([...times, next]);
+    this.timeInputs[this.timeInputs.length - 1].focus();
+    cx.notify();
+  }
+
+  removeTime(index, cx) {
+    this.showTimes(this.draftTimes().filter((_time, i) => i !== index));
+    cx.notify();
+  }
+
+  draftEffort() {
+    return EFFORTS[Math.round(Number(this.effortSlider.value()))]?.id ?? "";
+  }
+
   draftSchedule() {
     const { schedule } = this.editing.draft;
+    const times = this.draftTimes();
     return {
       ...schedule,
-      time: this.timeInput.value().trim(),
+      every: Number(this.everyInput.value().trim() || 0),
+      times,
+      time: times[0] ?? "",
       minute: Number(this.minuteInput.value().trim() || 0),
       cron: this.cronInput.value().trim(),
     };
@@ -175,6 +227,7 @@ export class RoutinesScreen {
       prompt: this.promptInput.value().trim(),
       folder: this.folderInput.value().trim().replace(/\/+$/, ""),
       schedule: this.draftSchedule(),
+      effort: this.draftEffort(),
       keep: Math.max(1, Math.floor(Number(this.keepInput.value().trim() || DEFAULT_KEPT_RUNS)) || DEFAULT_KEPT_RUNS),
     };
     if (routine.print) routine.push = false;
@@ -192,8 +245,7 @@ export class RoutinesScreen {
       if (routine.worktree && (await exec("git", ["rev-parse", "--show-toplevel"], { cwd: routine.folder, on: machine })).code !== 0) {
         this.formError = "Worktree coché, mais ce répertoire n'est pas dans un dépôt git."; cx.notify(); return;
       }
-      // A preset keeps its cron too, so "Avancé" opens on the same schedule.
-      routine.schedule.cron = scheduleCron(routine.schedule);
+      routine.schedule = normalizeSchedule(routine.schedule);
       // Saved during a minute it matches: that minute is not run late.
       routine.armedAt = startOfMinute(Date.now());
       try {
@@ -561,26 +613,116 @@ export class RoutinesScreen {
         .child(div().text_size(11).text_color(t.dim).child(hint)));
   }
 
+  timesRow(t) {
+    const removable = this.timeInputs.length > 1;
+    return h_flex().gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted).child("à")
+      .children(this.timeInputs.map((input, index) => h_flex().h(30).flex_none().items_center().rounded(7).border_1().border_color(t.input).bg(t.background)
+        .child(Input.new(input).w(54).h_full().pl(10).text_size(12.5).text_color(t.foreground))
+        .child(removable
+          ? h_flex().id(`schedule-time-remove-${index}`).size(22).mr(3).items_center().justify_center().rounded(5).text_color(t.dim)
+            .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.ansi1)).tooltip("Retirer cette heure")
+            .on_click((_e, cx) => this.removeTime(index, cx))
+            .child(svg(CLOSE).size(9))
+          : div().w(10))))
+      .child(h_flex().id("schedule-time-add").h(30).px(9).gap(5).flex_none().items_center().rounded(7).border_1().border_color(t.border)
+        .text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => this.addTime(cx))
+        .child(svg(PLUS).size(11)).child("heure"));
+  }
+
   scheduleEditor(t) {
     const draft = this.editing.draft;
     const schedule = this.draftSchedule();
     const problem = scheduleError(schedule);
     const machineClock = clockOf(this.machine);
     const next = problem || !machineClock ? null : nextRunOf(schedule, machineClock);
-    const timeRow = h_flex().gap(8).items_center().text_size(12).text_color(t.muted).child("à").child(this.input(this.timeInput, t, 80));
+    const muted = () => h_flex().gap(8).items_center().text_size(12).text_color(t.muted);
     return v_flex().gap(8)
       .child(this.chips("schedule-kind", PRESETS, schedule.kind, (kind) => { draft.schedule.kind = kind; }))
-      .when(schedule.kind === "hourly", (el) => el.child(h_flex().gap(8).items_center().text_size(12).text_color(t.muted)
-        .child("à la minute").child(this.input(this.minuteInput, t, 60))))
-      .when(schedule.kind === "daily" || schedule.kind === "weekdays", (el) => el.child(timeRow))
-      .when(schedule.kind === "weekly", (el) => el.child(h_flex().gap(10).items_center()
+      .when(schedule.kind === "interval", (el) => el.child(v_flex().gap(4)
+        .child(muted().child("toutes les").child(this.input(this.everyInput, t, 64)).child("minutes"))
+        .child(div().text_size(11).text_color(t.dim).child(`Comptées depuis minuit, de 1 à ${INTERVAL_MAX_MINUTES}.`))))
+      .when(schedule.kind === "hourly", (el) => el.child(muted().child("à la minute").child(this.input(this.minuteInput, t, 60))))
+      .when(schedule.kind === "daily" || schedule.kind === "weekdays", (el) => el.child(this.timesRow(t)))
+      .when(schedule.kind === "weekly", (el) => el.child(v_flex().gap(8)
         .child(this.chips("schedule-day", WEEKDAYS.map((d) => ({ id: d.day, label: d.short })), Number(schedule.weekday), (day) => { draft.schedule.weekday = day; }))
-        .child(timeRow)))
+        .child(this.timesRow(t))))
       .when(schedule.kind === "cron", (el) => el.child(v_flex().gap(4)
         .child(h_flex().child(this.input(this.cronInput, t)))
         .child(div().text_size(11).text_color(t.dim).child("5 champs : minute heure jour mois jour-de-semaine. « * * * * * » : chaque minute."))))
       .child(div().text_size(11.5).text_color(problem ? t.ansi1 : t.accent)
         .child(problem ? `Planification invalide : ${problem}` : next ? `Prochaine exécution : ${formatWhen(next)}` : "Aucune exécution dans les 5 ans"));
+  }
+
+  openModelMenu(draft) {
+    this.modelMenu.open = true;
+    this.modelMenu.highlighted = Math.max(0, MODELS.findIndex((m) => m.id === draft.model));
+  }
+
+  closeModelMenu() {
+    this.modelMenu.open = false;
+    this.modelMenu.trigger.focus();
+  }
+
+  pickModel(draft, id, cx) {
+    draft.model = id;
+    this.closeModelMenu();
+    cx.notify();
+  }
+
+  onModelMenuKey(draft, event, cx) {
+    const menu = this.modelMenu;
+    const moveBy = { up: -1, down: 1 }[event.key];
+    if (moveBy) menu.highlighted = (menu.highlighted + moveBy + MODELS.length) % MODELS.length;
+    else if (event.key === "enter" || event.key === "space") { this.pickModel(draft, MODELS[menu.highlighted].id, cx); return; }
+    else if (event.key === "escape") this.closeModelMenu();
+    else return;
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  modelSelect(t, draft) {
+    const menu = this.modelMenu;
+    const chosen = MODELS.find((m) => m.id === draft.model);
+    const trigger = h_flex().id("editor-model-trigger").h(30).w(170).px(10).gap(8).items_center().rounded(7).border_1()
+      .border_color(menu.open ? t.accent : t.input).bg(t.background).cursor_pointer().hover((s) => s.bg(t.hover))
+      .child(div().flex_1().text_size(12.5).text_color(chosen ? t.foreground : t.dim).child(chosen?.label ?? draft.model ?? "Choisir"))
+      .child(svg(CHEVRON_DOWN).size(12).text_color(t.dim));
+    const list = v_flex().id("editor-model-list").role("list_box").track_focus(menu.list).on_key_down((e, cx) => this.onModelMenuKey(draft, e, cx))
+      .w(170).mt(4).p(4).gap(2).rounded(8).border_1().border_color(t.border).bg(t.surface).shadow_lg()
+      .children(MODELS.map((model, index) => h_flex().id(`editor-model-${model.id}`).role("list_box_option").h(28).px(8).gap(8).items_center().rounded(6)
+        .when(index === menu.highlighted, (el) => el.bg(t.hover).aria_active_descendant())
+        .text_size(12.5).text_color(model.id === draft.model ? t.foreground : t.muted).cursor_pointer()
+        .on_mouse_move((_e, cx) => { if (menu.highlighted !== index) { menu.highlighted = index; cx.notify(); } })
+        .on_click((_e, cx) => this.pickModel(draft, model.id, cx))
+        .child(div().flex_1().child(model.label))
+        .when(model.id === draft.model, (el) => el.child(svg(CHECK).size(12).text_color(t.accent)))));
+    return Select.new("editor-model").accessibility_label("Modèle")
+      .open(menu.open)
+      .track_focus(menu.trigger)
+      .content_focus_handle(menu.list)
+      .on_open_change((open, cx) => { if (open) this.openModelMenu(draft); else menu.open = false; cx.notify(); })
+      .child(Popup.new("editor-model-popup", trigger).anchor("top_left")
+        .when(menu.open, (el) => el.content(list)));
+  }
+
+  effortPicker(t) {
+    const index = Math.round(Number(this.effortSlider.value()));
+    const effort = EFFORTS[index] ?? EFFORTS[0];
+    const color = effortColor(t, effort.id);
+    const slider = this.effortSlider;
+    return v_flex().w(EFFORT_LABEL_WIDTH * EFFORTS.length + 40).gap(2)
+      .child(Slider.new(slider).px(EFFORT_LABEL_WIDTH / 2).child(SliderTrack.new(slider).flex().items_center().h(24).w_full().cursor_pointer()
+        .child(SliderIndicator.new(slider).relative().w_full().h(EFFORT_GROOVE).rounded(EFFORT_GROOVE / 2).bg(t.border)
+          .range_style((fill) => fill.rounded(3).bg(color))
+          .child(SliderThumb.new(slider).size(EFFORT_THUMB).rounded(EFFORT_THUMB / 2).ml(-EFFORT_THUMB / 2).mt(-(EFFORT_THUMB - EFFORT_GROOVE) / 2)
+            .bg(t.background).border_2().border_color(color).shadow_sm()))))
+      .child(h_flex().justify_between().children(EFFORTS.map((option, i) => div().id(`editor-effort-${option.id || "default"}`).w(EFFORT_LABEL_WIDTH)
+        .text_center().text_size(11).cursor_pointer()
+        .text_color(i === index ? effortColor(t, option.id) : t.dim).when(i === index, (el) => el.font_semibold())
+        .hover((s) => s.text_color(t.foreground))
+        .on_click((_e, cx) => { slider.set_value(i); cx.notify(); })
+        .child(option.label))));
   }
 
   editor(t) {
@@ -604,8 +746,8 @@ export class RoutinesScreen {
           .when(!this.machine, (el) => el.child(this.textButton("editor-pick-folder", "Choisir…", "plain", (cx) => this.chooseFolder(cx)))),
           draft.worktree ? "Chaque run part d'un nouveau worktree de ce dépôt, sur une branche routine-…" : "La session tourne dans ce répertoire tel quel."))
         .child(h_flex().gap(24).items_start()
-          .child(this.field("Modèle", this.chips("editor-model", MODELS, draft.model, (id) => { draft.model = id; })))
-          .child(this.field("Effort", this.chips("editor-effort", EFFORTS, draft.effort, (id) => { draft.effort = id; }))))
+          .child(this.field("Modèle", this.modelSelect(t, draft)))
+          .child(this.field("Effort", this.effortPicker(t), "« Défaut » laisse --effort de côté.")))
         .child(this.field("Options", v_flex().gap(10)
           .child(this.optionRow("editor-enabled", "Activée", "Une routine désactivée ne se lance ni sur planning ni à la main.", draft.enabled, () => { draft.enabled = !draft.enabled; }))
           .child(this.optionRow("editor-worktree", "Worktree", "Un nouveau worktree par run, basé sur origin/HEAD.", draft.worktree, () => { draft.worktree = !draft.worktree; }))

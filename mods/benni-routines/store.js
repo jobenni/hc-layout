@@ -27,7 +27,7 @@ export const MODELS = [
 ];
 // From `claude --help` (2.1.332): --effort low|medium|high|xhigh|max. "" leaves the flag out.
 export const EFFORTS = [
-  { id: "", label: "Par défaut" },
+  { id: "", label: "Défaut" },
   { id: "low", label: "low" },
   { id: "medium", label: "medium" },
   { id: "high", label: "high" },
@@ -36,7 +36,9 @@ export const EFFORTS = [
 ];
 
 /**
- * @typedef {{kind: "hourly" | "daily" | "weekdays" | "weekly" | "cron", minute: number, time: string, weekday: number, cron: string}} Schedule
+ * @typedef {{kind: "interval" | "hourly" | "daily" | "weekdays" | "weekly" | "cron", every: number, minute: number,
+ *   times: string[], time: string, weekday: number, cron: string}} Schedule
+ *   times: "HH:MM" of daily, weekdays and weekly; time: their first, all a schedule had before times.
  * @typedef {{id: string, name: string, description: string, prompt: string, schedule: Schedule, folder: string,
  *   worktree: boolean, model: string, effort: string, print: boolean, enabled: boolean, keep: number,
  *   toast: boolean, push: boolean, armedAt: number | null}} Routine
@@ -229,7 +231,7 @@ export function blankRoutine() {
     name: "",
     description: "",
     prompt: "",
-    schedule: { kind: "daily", minute: 0, time: "09:00", weekday: 1, cron: "0 9 * * *" },
+    schedule: { kind: "daily", every: 30, minute: 0, times: ["09:00"], time: "09:00", weekday: 1, cron: "0 9 * * *" },
     folder: "",
     worktree: false,
     model: "sonnet",
