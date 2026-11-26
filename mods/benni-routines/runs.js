@@ -193,10 +193,10 @@ export async function followRunningRuns(machine) {
     const outcome = record.print ? await printOutcome(machine, record, Boolean(found)) : await interactiveOutcome(machine, record, Boolean(found));
     if (!outcome) continue;
     let ended = false;
+    // Applied to the cache, then to the file read fresh: the file's pass decides (another client may have ended it).
     await updateRun(machine, record.id, (r) => {
-      if (r.status !== "running") return;
-      Object.assign(r, outcome, { endedAt: Date.now() });
-      ended = true;
+      ended = r.status === "running";
+      if (ended) Object.assign(r, outcome, { endedAt: Date.now() });
     });
     if (ended) finished.push({ ...record, ...outcome });
   }

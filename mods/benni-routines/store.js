@@ -152,9 +152,9 @@ export async function syncStore(machine) {
     const runs = texts[RUNS_FILE] === null
       ? await changeMachineJson(machine, RUNS_FILE, { initial: () => keepUnderReadLimit(normalizeRuns(legacy)), change: (data) => data })
       : parse(RUNS_FILE);
-    publish(machine, { ...normalizeRoutines(routines), ...runsFromFile(machine, runs), state: "ready", error: "" });
+    publish(machine, { ...normalizeRoutines(routines), ...runsFromFile(machine, runs), state: "ready", error: "", everRead: true });
   } catch (error) {
-    publish(machine, { state: cacheEntry(machine) ? "offline" : "unknown", error: String(error?.message ?? error) });
+    publish(machine, { state: cacheEntry(machine)?.everRead ? "offline" : "unknown", error: String(error?.message ?? error) });
   }
 }
 
@@ -173,7 +173,7 @@ async function changeFile(machine, name, { initial, fromFile, toFile, normalize,
         return toFile(normalize(value));
       },
     });
-    publish(machine, { ...fromFile(written), state: "ready", error: "" });
+    publish(machine, { ...fromFile(written), state: "ready", error: "", everRead: true });
   } catch (error) {
     await syncStore(machine);
     throw error;

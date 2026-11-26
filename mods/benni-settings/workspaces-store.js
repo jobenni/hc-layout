@@ -47,9 +47,11 @@ export function workspaceOfSpace(store, spaceId) {
   return store.list.some((w) => w.id === id) ? id : DEFAULT_WORKSPACE.id;
 }
 
+// everRead: some copy was read once, so a failed read can say "last known copy" rather than defaults.
 function publish(machine, store, state, error = "") {
   const cache = { ...(shared(WORKSPACES_CACHE_KEY) ?? {}) };
-  const entry = { ...store, state, error };
+  const everRead = state === "ready" || Boolean(cache[machineKey(machine)]?.everRead);
+  const entry = { ...store, state, error, everRead };
   if (JSON.stringify(cache[machineKey(machine)]) === JSON.stringify(entry)) return;
   cache[machineKey(machine)] = entry;
   setShared(WORKSPACES_CACHE_KEY, cache);
@@ -57,7 +59,7 @@ function publish(machine, store, state, error = "") {
 
 function markOffline(machine, error) {
   const known = (shared(WORKSPACES_CACHE_KEY) ?? {})[machineKey(machine)];
-  publish(machine, normalizeWorkspaces(known), known ? "offline" : "unknown", String(error?.message ?? error));
+  publish(machine, normalizeWorkspaces(known), known?.everRead ? "offline" : "unknown", String(error?.message ?? error));
 }
 
 // A machine without its file starts from its own Herdr's workspaces (its shared.json, read only),

@@ -150,9 +150,10 @@ export class RoutineScheduler {
   // entry per routine with their count, leaving out minutes some client did start (their claim exists).
   async recordMissedRuns(machine, lastTick, now, machineClock) {
     const claims = await listClaims(machine);
-    const from = machineClock.toWall(startOfMinute(lastTick));
     const to = machineClock.toWall(startOfMinute(now));
     for (const routine of readStore(machine).routines.filter((r) => r.enabled)) {
+      // Nothing is missed before the routine was last turned on or saved.
+      const from = machineClock.toWall(startOfMinute(Math.max(lastTick, routine.armedAt ?? 0)));
       let missed;
       try { missed = occurrencesBetween(parseCron(scheduleCron(routine.schedule)), from, to, MAX_MISSED_COUNTED); } catch { continue; }
       const times = missed.map((wall) => machineClock.toTime(wall)).filter((time) => !claims.has(runClaim(routine.id, time)));
