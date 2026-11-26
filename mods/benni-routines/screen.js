@@ -1,5 +1,5 @@
 import { div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Select, Popup, SliderState, Slider, SliderTrack, SliderIndicator, SliderThumb } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Select, Popup } from "gpui-base";
 import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, machines } from "herdr";
 import { readStore, readAllStores, changeRoutines, changeRuns, syncStore, storeState, clockOf, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
 import { PRESETS, WEEKDAYS, INTERVAL_MAX_MINUTES, describeSchedule, scheduleError, normalizeSchedule, timesOf, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
@@ -15,8 +15,12 @@ const CHEVRON_DOWN = "mods/workspace-chrome/chevron-down.svg";
 const CHECK = "mods/workspace-chrome/check.svg";
 const PLUS = "mods/workspace-chrome/plus.svg";
 const EFFORT_LABEL_WIDTH = 52;
+const EFFORT_STOP_GAP = 60;
+const EFFORT_WIDTH = EFFORT_LABEL_WIDTH + EFFORT_STOP_GAP * 5;
+const EFFORT_TRACK_HEIGHT = 24;
 const EFFORT_THUMB = 16;
 const EFFORT_GROOVE = 6;
+const EFFORT_DOT = 4;
 const LIST_WIDTH = 340;
 const LAYOUT_CHECK_MS = 1000;
 const STATUS_LABEL = { running: "En cours", done: "Terminé", failed: "Échec", missed: "Manqué" };
@@ -52,15 +56,8 @@ export class RoutinesScreen {
     this.folderInput = InputState.new({ placeholder: "/chemin/du/projet" });
     this.keepInput = InputState.new({ placeholder: String(DEFAULT_KEPT_RUNS) });
     for (const input of [this.everyInput, this.minuteInput, this.cronInput]) input.on("change", (_e, cx) => cx.notify());
-    this.effortSlider = SliderState.new({ min: 0, max: EFFORTS.length - 1, step: 1 });
-    // The slider moves by whole levels: a drag between two stops snaps to the nearest.
-    const snapEffort = (value, cx) => {
-      const level = Math.round(Number(value));
-      if (level !== value) this.effortSlider.set_value(level);
-      cx.notify();
-    };
-    this.effortSlider.on("change", snapEffort);
-    this.effortSlider.on("release", snapEffort);
+    this.effortLevel = 0; // index in EFFORTS
+    this.draggingEffort = false;
     this.modelMenu = { open: false, highlighted: 0, trigger: cx.focus_handle(), list: cx.focus_handle() };
     if (checking()) return;
     cx.timer.every(LAYOUT_CHECK_MS, () => this.closeWhenColumnMoved());
@@ -169,7 +166,7 @@ export class RoutinesScreen {
     this.promptInput.set_value(draft.prompt);
     this.showTimes(timesOf(draft.schedule).map((time) => time ?? "09:00"));
     this.everyInput.set_value(String(draft.schedule.every ?? 30));
-    this.effortSlider.set_value(Math.max(0, EFFORTS.findIndex((e) => e.id === (draft.effort ?? ""))));
+    this.effortLevel = Math.max(0, EFFORTS.findIndex((e) => e.id === (draft.effort ?? "")));
     this.modelMenu.open = false;
     this.minuteInput.set_value(String(draft.schedule.minute ?? 0));
     this.cronInput.set_value(draft.schedule.cron ?? "");
@@ -209,7 +206,7 @@ export class RoutinesScreen {
   }
 
   draftEffort() {
-    return EFFORTS[Math.round(Number(this.effortSlider.value()))]?.id ?? "";
+    return EFFORTS[this.effortLevel]?.id ?? "";
   }
 
   draftSchedule() {
@@ -721,24 +718,41 @@ export class RoutinesScreen {
         .when(menu.open, (el) => el.content(list)));
   }
 
+  // The stop nearest to `x` (pixels from the picker's left edge): the thumb only ever rests on a level.
+  pointEffort(x, cx) {
+    if (x === undefined) return;
+    const level = Math.min(EFFORTS.length - 1, Math.max(0, Math.round((x - EFFORT_LABEL_WIDTH / 2) / EFFORT_STOP_GAP)));
+    if (level !== this.effortLevel) { this.effortLevel = level; cx.notify(); }
+  }
+
   effortPicker(t) {
-    const index = Math.round(Number(this.effortSlider.value()));
-    const effort = EFFORTS[index] ?? EFFORTS[0];
-    const color = effortColor(t, effort.id);
-    const slider = this.effortSlider;
-    return v_flex().w(EFFORT_LABEL_WIDTH * EFFORTS.length + 40).gap(2)
-      .child(Slider.new(slider).px(EFFORT_LABEL_WIDTH / 2).child(SliderTrack.new(slider).flex().items_center().h(24).w_full().cursor_pointer()
-        .child(SliderIndicator.new(slider).relative().w_full().h(EFFORT_GROOVE).rounded(EFFORT_GROOVE / 2).bg(t.border)
-          .range_style((fill) => fill.rounded(3).bg(color))
-          .child(SliderThumb.new(slider).size(EFFORT_THUMB).rounded(EFFORT_THUMB / 2).ml(-EFFORT_THUMB / 2).mt(-(EFFORT_THUMB - EFFORT_GROOVE) / 2)
-            .bg(t.background).border_2().border_color(color).shadow_sm()))))
-      .child(h_flex().justify_between().children(EFFORTS.map((option, i) => div().id(`editor-effort-${option.id || "default"}`).w(EFFORT_LABEL_WIDTH)
-        .text_center().text_size(11).cursor_pointer()
-        .text_color(i === index ? effortColor(t, option.id) : t.dim).when(i === index, (el) => el.font_semibold())
-        .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, cx) => { slider.set_value(i); cx.notify(); })
+    const level = this.effortLevel;
+    const color = effortColor(t, EFFORTS[level]?.id);
+    const stopX = (i) => EFFORT_LABEL_WIDTH / 2 + i * EFFORT_STOP_GAP;
+    const grooveTop = (EFFORT_TRACK_HEIGHT - EFFORT_GROOVE) / 2;
+    const track = div().relative().w_full().h(EFFORT_TRACK_HEIGHT)
+      .child(div().absolute().left(stopX(0)).w(stopX(EFFORTS.length - 1) - stopX(0)).top(grooveTop).h(EFFORT_GROOVE).rounded(EFFORT_GROOVE / 2).bg(t.border))
+      .child(div().absolute().left(stopX(0)).w(stopX(level) - stopX(0)).top(grooveTop).h(EFFORT_GROOVE).rounded(EFFORT_GROOVE / 2).bg(color))
+      .children(EFFORTS.map((_option, i) => div().absolute().left(stopX(i) - EFFORT_DOT / 2).top((EFFORT_TRACK_HEIGHT - EFFORT_DOT) / 2)
+        .size(EFFORT_DOT).rounded(EFFORT_DOT / 2).bg(i <= level ? t.background : t.dim)))
+      .child(div().absolute().left(stopX(level) - EFFORT_THUMB / 2).top((EFFORT_TRACK_HEIGHT - EFFORT_THUMB) / 2)
+        .size(EFFORT_THUMB).rounded(EFFORT_THUMB / 2).bg(t.background).border_2().border_color(color).shadow_sm());
+    return v_flex().id("editor-effort").w(EFFORT_WIDTH).gap(2).cursor_pointer()
+      .on_mouse_down("left", (e, cx) => { this.draggingEffort = true; this.pointEffort(e.local_position?.x, cx); })
+      .on_mouse_move((e, cx) => {
+        if (!this.draggingEffort) return;
+        if (e.pressed_button !== "left") { this.draggingEffort = false; return; }
+        this.pointEffort(e.local_position.x, cx);
+      })
+      .on_window_mouse_up("left", () => { this.draggingEffort = false; })
+      .child(track)
+      .child(h_flex().children(EFFORTS.map((option, i) => div().w(EFFORT_LABEL_WIDTH).flex_none()
+        .mr(i < EFFORTS.length - 1 ? EFFORT_STOP_GAP - EFFORT_LABEL_WIDTH : 0)
+        .text_center().text_size(11)
+        .text_color(i === level ? effortColor(t, option.id) : t.dim).when(i === level, (el) => el.font_semibold())
         .child(option.label))));
   }
+
 
   editor(t) {
     const { draft, isNew } = this.editing;
