@@ -2,10 +2,10 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar } from "gpui-base";
 import { spaces, panes, agents, terminals, focused, exec, readTextFile, theme, window, layout, props, run, appHome, home, checking } from "herdr";
 import {
-  readWorktrees, readOpenIssues, readPullRequests, readViewerLogin, setSelfAssigned,
-  issueBranchNumber, issueBranchName, checkSteps, checksSummary, defaultBaseRef, addWorktree,
-  isPullRequestFinished, hasUncommittedChanges, removeWorktreeAndBranch,
-} from "./github.js";
+  readWorktrees, issueBranchNumber, issueBranchName, defaultBaseRef, addWorktree,
+  hasUncommittedChanges, removeWorktreeAndBranch,
+} from "./git.js";
+import { forgeOf, checksSummary, isPullRequestFinished } from "./forge.js";
 
 const REFRESH_EVERY_MS = 30000;
 const ICONS = "mods/gh-issues/icons";
@@ -106,7 +106,12 @@ function pullRequestLook(pr, t) {
   return { icon: `${ICONS}/pr-open.svg`, color: t.ansi2 };
 }
 
-const initialsOf = (login) => login.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
+// "Johan BONASSI" gives JB; a single word, like a GitHub login, gives its first two letters.
+function initialsOf(name) {
+  const words = name.split(/\s+/).filter(Boolean);
+  const letters = words.length > 1 ? words[0][0] + words[1][0] : name.replace(/[^A-Za-z0-9]/g, "").slice(0, 2);
+  return letters.toUpperCase() || "?";
+}
 // The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
 // xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
 const OPEN_ON_LINUX = 'if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then command -v wslview >/dev/null 2>&1 && exec wslview "$1"; exec explorer.exe "$1"; fi; exec xdg-open "$1"';
@@ -119,8 +124,10 @@ const openUrl = (url, cx) => {
 export default class GhIssues extends View {
   init(_props, cx) {
     this.repo = null;
+    this.forge = null;
     this.viewer = null;
     this.issues = [];
+    this.scope = null;
     this.sessions = new Map();
     this.linkedWorktrees = [];
     this.pullRequests = new Map();
@@ -149,29 +156,32 @@ export default class GhIssues extends View {
   refresh(cx, { withGithub }) {
     if (this.loading) return;
     const { cwd, on, branch } = location();
-    if (!cwd) { this.repo = null; this.issues = []; this.error = "Aucun dossier"; return; }
+    if (!cwd) { this.repo = null; this.forge = null; this.issues = []; this.scope = null; this.error = "Aucun dossier"; return; }
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
         const worktrees = await readWorktrees(cwd, on);
         const main = worktrees[0]?.path;
-        const repoChanged = main !== this.repo?.main;
+        const repoChanged = main !== this.repo?.main || on !== this.repo?.on;
         this.repo = { main, name: main?.split("/").pop(), on };
+        if (repoChanged || !this.forge) { this.forge = await forgeOf(main, on); this.viewer = null; }
+        const forge = this.forge;
         this.linkedWorktrees = worktrees.slice(1).filter((w) => w.branch);
         this.sessions = new Map(this.linkedWorktrees
           .map((w) => [issueBranchNumber(w.branch), w])
           .filter(([number]) => number !== null));
-        if (repoChanged) { this.pullRequests = new Map(); this.cleanupConfirming = null; this.cleanupReport = ""; }
+        if (repoChanged) { this.issues = []; this.scope = null; this.pullRequests = new Map(); this.cleanupConfirming = null; this.cleanupReport = ""; }
         if (withGithub || repoChanged) {
           // A merged or closed PR stays so: its branch is not asked again.
           const finished = new Map([...this.pullRequests].filter(([, pr]) => isPullRequestFinished(pr)));
           const branches = [branch, ...this.linkedWorktrees.map((w) => w.branch)].filter((b) => !finished.has(b));
-          const [issues, pullRequests, viewer] = await Promise.all([
-            readOpenIssues(main, on),
-            readPullRequests(branches, main, on),
-            this.viewer && !repoChanged ? this.viewer : readViewerLogin(main, on).catch(() => null),
+          const [{ issues, scope }, pullRequests, viewer] = await Promise.all([
+            forge.readOpenIssues(),
+            forge.readPullRequests(branches),
+            this.viewer ?? forge.readViewer().catch(() => null),
           ]);
           this.issues = issues;
+          this.scope = scope;
           this.pullRequests = new Map([...finished, ...pullRequests]);
           this.viewer = viewer;
         }
@@ -179,7 +189,7 @@ export default class GhIssues extends View {
         this.error = "";
       } catch (error) {
         this.error = String(error?.message ?? error);
-        if (/not a git repository/i.test(this.error)) { this.repo = null; this.issues = []; this.error = "Pas un dépôt Git"; }
+        if (/not a git repository/i.test(this.error)) { this.repo = null; this.forge = null; this.issues = []; this.scope = null; this.error = "Pas un dépôt Git"; }
       } finally {
         this.loading = false;
         cx.notify();
@@ -204,7 +214,7 @@ export default class GhIssues extends View {
           folder: path,
           machine: on ?? "",
           tab: `#${issue.number}`,
-          argv: ["env", `CLAUDE_PROMPT_DRAFT=Traite l'issue ${issue.url}`, "sh", "-c", CLAUDE_VIA_LOGIN_SHELL, "sh", "--plugin-dir", pluginDir],
+          argv: ["env", `CLAUDE_PROMPT_DRAFT=${this.forge.workPrompt(issue)}`, "sh", "-c", CLAUDE_VIA_LOGIN_SHELL, "sh", "--plugin-dir", pluginDir],
         });
       } catch (error) {
         this.note = `Lancement impossible : ${error?.message ?? error}`;
@@ -223,10 +233,7 @@ export default class GhIssues extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        await setSelfAssigned(issue.number, !isAssigned, this.repo.main, this.repo.on);
-        issue.assignees = isAssigned
-          ? issue.assignees.filter((a) => a.login !== this.viewer)
-          : [...(issue.assignees ?? []), { login: this.viewer ?? "moi" }];
+        issue.assignees = await this.forge.setSelfAssigned(issue, this.viewer, !isAssigned);
       } catch (error) {
         this.note = `Affectation impossible : ${error?.message ?? error}`;
       } finally {
@@ -247,7 +254,7 @@ export default class GhIssues extends View {
   }
 
   isAssignedToViewer(issue) {
-    return Boolean(this.viewer) && (issue.assignees ?? []).some((a) => a.login === this.viewer);
+    return Boolean(this.viewer) && (issue.assignees ?? []).some((a) => a.id === this.viewer.id);
   }
 
   openSession(session) {
@@ -338,12 +345,13 @@ export default class GhIssues extends View {
     if (this.error) return this.error;
     if (this.loading) return "Chargement des issues…";
     if (!this.repo) return "Aucun dépôt";
-    return this.onlyMine && this.issues.length ? "Aucune issue ouverte ne t'est assignée" : "Aucune issue ouverte";
+    if (this.onlyMine && this.issues.length) return "Aucune issue ouverte ne t'est assignée";
+    return this.forge?.name === "Azure DevOps" ? "Aucun work item ouvert dans le sprint en cours" : "Aucune issue ouverte";
   }
 
   repoLabel() {
     if (!this.repo?.name) return "";
-    return this.repo.on ? `${this.repo.name} · ${this.repo.on}` : this.repo.name;
+    return [this.repo.name, this.repo.on, this.scope].filter(Boolean).join(" · ");
   }
 
   header(t) {
@@ -374,13 +382,14 @@ export default class GhIssues extends View {
     const assignees = issue.assignees ?? [];
     const isAssigning = this.assigning === issue.number;
     const canAssignSelf = Boolean(this.viewer) && !this.isAssignedToViewer(issue);
+    const replaced = this.forge?.hasSingleAssignee ? assignees[0] : null;
     return h_flex().flex_none().gap(2).items_center()
-      .children(assignees.slice(0, 3).map((a) => a.login === this.viewer
+      .children(assignees.slice(0, 3).map((a) => a.id === this.viewer?.id
         ? this.viewerBadge(issue, isAssigning, t)
-        : this.badge(t.raised, t.muted).id(`assignee-${issue.number}-${a.login}`).tooltip(a.login).child(initialsOf(a.login))))
+        : this.badge(t.raised, t.muted).id(`assignee-${issue.number}-${a.id}`).tooltip(a.name).child(initialsOf(a.name))))
       .when(assignees.length > 3, (el) => el.child(div().text_size(10).text_color(t.dim).child(`+${assignees.length - 3}`)))
       .when(canAssignSelf, (el) => el.child(this.badge(t.background, t.dim).id(`assign-${issue.number}`)
-        .border_1().border_color(t.border).cursor_pointer().tooltip("M'assigner")
+        .border_1().border_color(t.border).cursor_pointer().tooltip(replaced ? `M'assigner (remplace ${replaced.name})` : "M'assigner")
         .hover((s) => s.text_color(t.foreground).border_color(t.accent))
         .on_click((_e, cx) => { if (!isAssigning) this.toggleSelfAssigned(issue, cx); })
         .child(isAssigning ? "…" : "+")));
@@ -390,7 +399,7 @@ export default class GhIssues extends View {
     return this.badge(t.accent, t.accent_foreground).id(`unassign-${issue.number}`).cursor_pointer().tooltip("Me retirer")
       .hover((s) => s.bg(t.ansi1).text_color("#ffffff"))
       .on_click((_e, cx) => { if (!isAssigning) this.toggleSelfAssigned(issue, cx); })
-      .child(isAssigning ? "…" : initialsOf(this.viewer));
+      .child(isAssigning ? "…" : initialsOf(this.viewer.name));
   }
 
   badge(background, color) {
@@ -415,12 +424,12 @@ export default class GhIssues extends View {
   issueRow(issue, t) {
     const session = this.sessions.get(issue.number);
     const pr = session ? this.pullRequests.get(session.branch) : null;
-    const summary = pr ? checksSummary(checkSteps(pr)) : "none";
+    const summary = pr ? checksSummary(pr.checks) : "none";
     return h_flex().id(`issue-${issue.number}`).flex_none().h(30).px(8).gap(8).items_center().rounded(7)
       .hover((s) => s.bg(t.hover))
       .child(svg(`${ICONS}/issue.svg`).size(14).flex_none().text_color(t.ansi2))
       .child(div().id(`issue-link-${issue.number}`).w(40).flex_none().text_size(11).text_color(t.dim).cursor_pointer()
-        .hover((s) => s.text_color(t.accent)).tooltip("Voir sur GitHub")
+        .hover((s) => s.text_color(t.accent)).tooltip(`Voir sur ${this.forge?.name ?? "GitHub"}`)
         .on_click((_e, cx) => openUrl(issue.url, cx)).child(`#${issue.number}`))
       .child(div().flex_1().min_w(0).truncate().child(issue.title))
       .when(Boolean(session), (el) => el.child(div().flex_none().px(5).py(1).rounded(4).text_size(10)
@@ -437,7 +446,7 @@ export default class GhIssues extends View {
   }
 
   pullRequestBlock(pr, t, scope) {
-    const steps = checkSteps(pr);
+    const steps = pr.checks;
     const look = pullRequestLook(pr, t);
     const stateLabel = pr.isDraft && pr.state === "OPEN" ? "brouillon" : PR_STATE_LABEL[pr.state] ?? pr.state.toLowerCase();
     return v_flex().gap(4)
