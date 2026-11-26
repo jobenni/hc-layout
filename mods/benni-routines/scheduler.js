@@ -1,6 +1,6 @@
 import { div } from "gpui-kit";
 import { notify, openOverlay, closeOverlay, nextCommand, checking, layout, settings, shared, setShared, machines, exec } from "herdr";
-import { readStore, readAllStores, changeRuns, newId, syncStore, storeState, clockOf, readUtcOffset, publishUtcOffset } from "./store.js";
+import { readStore, readAllStores, changeRuns, newId, syncStore, storeState, clockOf, readUtcOffset, publishUtcOffset, publishNextRuns } from "./store.js";
 import { compileSchedule, startOfMinute } from "./schedule.js";
 import { startRun, followRunningRuns, purgeOldRuns } from "./runs.js";
 import { machineKey, machineOfKey, machineAppDir } from "./machine-files.js";
@@ -17,9 +17,11 @@ const CLAIMS_KEPT_MINUTES = 2880;
 const MAX_MISSED_COUNTED = 10000;
 // Checks are 15s apart: a longer silence means the minutes in between were never looked at.
 const MISSED_AFTER_MS = 75000;
-// The toast's click names the run it wants through this key: a mod command can't carry arguments.
-// { machine: machineKey, run: runId } (a plain id, from before machines, is this computer's).
-export const RUN_TO_SHOW_KEY = "benni.routines.show";
+// What the screen opens on, set before `benni-routines.open-target` (or a toast's `open-run`): a mod command
+// can't carry arguments. { machine: machineKey, run?: runId, routine?: routineId } (a plain id, from before
+// machines, is this computer's run).
+export const SCREEN_TARGET_KEY = "benni.routines.show";
+
 
 // A minute of a routine is started by whoever creates its claim folder first on the routine's machine,
 // so two clients connected to it never start the same minute twice.
@@ -44,10 +46,11 @@ async function cleanClaims(machine) {
   await exec("find", [dir, "-mindepth", "1", "-maxdepth", "1", "-type", "d", "-mmin", `+${CLAIMS_KEPT_MINUTES}`, "-exec", "rmdir", "{}", "+"], { on: machine });
 }
 
-export function runToShow() {
-  const target = shared(RUN_TO_SHOW_KEY);
-  if (typeof target === "string") return { machine: null, run: target };
-  return target && typeof target === "object" ? { machine: machineOfKey(target.machine ?? ""), run: target.run } : null;
+export function screenTarget() {
+  const target = shared(SCREEN_TARGET_KEY);
+  if (typeof target === "string") return { machine: null, run: target, routine: null };
+  if (!target || typeof target !== "object") return null;
+  return { machine: machineOfKey(target.machine ?? ""), run: target.run ?? null, routine: target.routine ?? null };
 }
 
 function findNode(node, id) {
@@ -82,7 +85,10 @@ export class RoutineScheduler {
     this.syncAll(cx);
     cx.timer.every(SYNC_MS, (cx) => this.syncAll(cx));
     cx.timer.every(1000, (cx) => this.syncReturningMachines(cx));
-    cx.timer.every(TICK_MS, (cx) => { for (const machine of this.knownMachines()) this.tick(machine, cx); });
+    cx.timer.every(TICK_MS, (cx) => {
+      for (const machine of this.knownMachines()) this.tick(machine, cx);
+      publishNextRuns();
+    });
     cx.timer.every(FOLLOW_MS, (cx) => {
       for (const [machine, store] of readAllStores()) if (store.runs.some((r) => r.status === "running")) this.follow(machine, cx);
     });
@@ -90,7 +96,7 @@ export class RoutineScheduler {
       for (;;) {
         const command = await nextCommand();
         if (command === "open") this.openScreen(null);
-        else if (command === "open-run") this.openScreen(runToShow());
+        else if (command === "open-target" || command === "open-run") this.openScreen(screenTarget());
       }
     });
   }
@@ -240,7 +246,7 @@ export class RoutineScheduler {
   toastFinished(machine, record) {
     const failed = record.status === "failed";
     const firstLine = (record.summary || record.error || "").split("\n").find((l) => l.trim()) ?? "";
-    setShared(RUN_TO_SHOW_KEY, { machine: machineKey(machine), run: record.id });
+    setShared(SCREEN_TARGET_KEY, { machine: machineKey(machine), run: record.id });
     notify({
       title: failed ? `Routine « ${record.routineName} » en échec` : `Routine « ${record.routineName} » terminée`,
       body: `${machine ? `${machine} · ` : ""}${firstLine}`.slice(0, 200),

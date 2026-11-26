@@ -4,7 +4,7 @@ import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, ma
 import { readStore, readAllStores, changeRoutines, changeRuns, syncStore, storeState, clockOf, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
 import { PRESETS, WEEKDAYS, INTERVAL_MAX_MINUTES, describeSchedule, scheduleError, normalizeSchedule, timesOf, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
 import { startRun, purgeOldRuns, focusRunTab, resumeInTab, closeRunTab, cleanWorktree, removeRunFiles } from "./runs.js";
-import { workColumnBounds, runToShow } from "./scheduler.js";
+import { workColumnBounds, screenTarget } from "./scheduler.js";
 
 const SPINNER = "mods/workspace-chrome/spinner.svg";
 const CLOCK = "mods/workspace-chrome/clock.svg";
@@ -42,8 +42,9 @@ export class RoutinesScreen {
     this.handle.focus();
     const target = props()?.target ?? null;
     this.machine = target?.machine ?? null; // whose routines and runs show: null is this computer
-    const shownRun = readStore(this.machine).runs.find((r) => r.id === target?.run);
-    this.filter = null;
+    const { routines, runs } = readStore(this.machine);
+    const shownRun = runs.find((r) => r.id === target?.run);
+    this.filter = routines.some((r) => r.id === target?.routine) ? target.routine : null;
     this.expandedRun = shownRun?.print ? shownRun.id : null;
     this.highlightedRun = shownRun?.id ?? null;
     this.editing = null;
@@ -75,7 +76,7 @@ export class RoutinesScreen {
       for (;;) {
         const command = await nextCommand();
         if (command === "close") { this.close(); return; }
-        if (command === "open-run") this.showRun(runToShow(), cx);
+        if (command === "open-target" || command === "open-run") this.showTarget(screenTarget(), cx);
       }
     });
     this.reload(cx);
@@ -86,13 +87,15 @@ export class RoutinesScreen {
     cx.spawn(async (cx) => { await syncStore(machine); cx.notify(); });
   }
 
-  showRun(target, cx) {
+  // A run (a toast's), a routine (the sidebar's) or a machine's whole history.
+  showTarget(target, cx) {
     if (!target) return;
     this.chooseMachine(target.machine, cx);
-    const record = readStore(this.machine).runs.find((r) => r.id === target.run);
-    if (!record) return;
+    const { routines, runs } = readStore(this.machine);
     this.editing = null;
-    this.filter = null;
+    this.filter = routines.some((r) => r.id === target.routine) ? target.routine : null;
+    const record = runs.find((r) => r.id === target.run);
+    if (!record) { cx.notify(); return; }
     this.highlightedRun = record.id;
     if (record.print) this.expandedRun = record.id;
     cx.notify();

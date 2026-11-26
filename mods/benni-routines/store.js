@@ -1,6 +1,6 @@
 import { shared, setShared, checking, exec } from "herdr";
 import { machineKey, machineOfKey, appId, bareId, readMachineFiles, changeMachineJson, jsonText } from "./machine-files.js";
-import { localClock, offsetClock, parseUtcOffset } from "./schedule.js";
+import { localClock, offsetClock, parseUtcOffset, nextRunOf } from "./schedule.js";
 
 // Each machine keeps its routines in its own Herdr app folder (see machine-files.js):
 //   benni/routines.json  { routines: Routine[] }                           edited by hand, rarely
@@ -10,6 +10,9 @@ import { localClock, offsetClock, parseUtcOffset } from "./schedule.js";
 // state, error } } with this app's ids (`machine/` prefix), which every mod draws from. Writes read the
 // files again first: the cache is never written back as is.
 export const ROUTINES_CACHE_KEY = "benni.machines.routines";
+// Each enabled routine's next run, for the sidebar (which can't import schedule.js), recomputed on every
+// change of the cache and every scheduler tick: { [machineKey]: { [routineId]: epoch ms } }.
+export const NEXT_RUNS_KEY = "benni.routines.next";
 // What the layout used before routines were per machine: read once, to start this computer's files.
 const LEGACY_KEY = "benni.routines";
 const ROUTINES_FILE = "benni/routines.json";
@@ -122,6 +125,22 @@ function publish(machine, change) {
   if (JSON.stringify(cache[key]) === JSON.stringify(entry)) return;
   cache[key] = entry;
   setShared(ROUTINES_CACHE_KEY, cache);
+  publishNextRuns();
+}
+
+export function publishNextRuns() {
+  const next = {};
+  for (const [machine, store] of readAllStores()) {
+    const machineClock = clockOf(machine);
+    if (!machineClock) continue;
+    const times = {};
+    for (const routine of store.routines.filter((r) => r.enabled)) {
+      const time = nextRunOf(routine.schedule, machineClock)?.getTime();
+      if (time) times[routine.id] = time;
+    }
+    next[machineKey(machine)] = times;
+  }
+  if (JSON.stringify(shared(NEXT_RUNS_KEY) ?? null) !== JSON.stringify(next)) setShared(NEXT_RUNS_KEY, next);
 }
 
 export function publishUtcOffset(machine, utcOffset) {

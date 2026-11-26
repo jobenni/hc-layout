@@ -104,6 +104,28 @@ const RESTING_CARD_TTL = 86400000;
 const routinesSpaceIds = () => new Set(Object.values(shared("benni.machines.routines") ?? {}).map((store) => store?.spaceId).filter(Boolean));
 const isRoutinesSpace = (spaceId) => routinesSpaceIds().has(spaceId);
 const isRoutineSession = (a) => Boolean(a.space) && isRoutinesSpace(a.space);
+// Each machine's routines (shared("benni.machines.routines")) and their next runs (shared("benni.routines.next"),
+// epoch ms, both written by benni-routines), listed above the machine's workspace tabs.
+const routinesStoreOf = (machine) => (shared("benni.machines.routines") ?? {})[machineKey(machine)] ?? null;
+const nextRunsOf = (machine) => (shared("benni.routines.next") ?? {})[machineKey(machine)] ?? {};
+// A mod command takes no arguments: the screen reads what to show from this key, as for a toast's run.
+const openRoutinesScreen = (machine, routineId = null) => {
+  setShared("benni.routines.show", { machine: machineKey(machine), routine: routineId });
+  run("benni-routines.open-target");
+};
+const ROUTINES_LIST_MAX_HEIGHT = 180;
+const DAY_NAMES = ["dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam."];
+const MONTH_NAMES = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+// "14:05" today, "demain 09:00", "lun. 09:00" within the week, else "3 déc.".
+function nextRunText(time, now = Date.now()) {
+  const date = new Date(time);
+  const clock = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  const dayDiff = Math.round((new Date(time).setHours(0, 0, 0, 0) - new Date(now).setHours(0, 0, 0, 0)) / 86400000);
+  if (dayDiff <= 0) return clock;
+  if (dayDiff === 1) return `demain ${clock}`;
+  if (dayDiff < 7) return `${DAY_NAMES[date.getDay()]} ${clock}`;
+  return `${date.getDate()} ${MONTH_NAMES[date.getMonth()]}`;
+}
 // gh (and git pushing through gh's credentials) answers as the folder's account only through its mise env (GH_TOKEN).
 const WITH_FOLDER_ENV = 'command -v mise >/dev/null 2>&1 && exec mise exec -- "$@"; exec "$@"';
 
@@ -622,6 +644,43 @@ export default class Spaces extends View {
     const tabs = store.list.map((ws) => this.workspaceTab(machine, ws, rows.filter((r) => r.ws === ws.id), ws.id === shown, t, collapsed));
     if (collapsed) return v_flex().flex_none().gap(2).pb(6).children(tabs);
     return h_flex().id(`workspace-tabs-${machineKey(machine)}`).flex_none().h(32).px(8).gap(2).items_center().overflow_x_scroll().children(tabs);
+  }
+
+  // One machine's routines, above its workspace tabs: nothing when it has none (or in the rail).
+  routinesSection(machine, t, { maxHeight = null } = {}) {
+    const store = routinesStoreOf(machine);
+    const routines = store?.routines ?? [];
+    if (!routines.length) return null;
+    const key = machineKey(machine) || "local";
+    const nextRuns = nextRunsOf(machine);
+    const running = new Set((store.runs ?? []).filter((r) => r.status === "running").map((r) => r.routine));
+    const rows = routines.map((routine) => {
+      const isRunning = running.has(routine.id);
+      const next = nextRuns[routine.id];
+      const status = isRunning ? div().text_color(t.working).child("en cours")
+        : !routine.enabled ? div().child("désactivée")
+        : next ? div().child(nextRunText(next)) : div().child("—");
+      return h_flex().id(`routine-row-${key}-${routine.id}`).h(26).flex_none().px(8).gap(7).items_center().rounded(7)
+        .cursor_pointer().hover((s) => s.bg(t.hover))
+        .tooltip(routine.description ? `${routine.name} · ${routine.description}` : routine.name)
+        .on_click(() => openRoutinesScreen(machine, routine.id))
+        .child(isRunning
+          ? svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)
+          : svg("mods/workspace-chrome/clock.svg").size(12).flex_none().text_color(routine.enabled ? t.muted : t.dim))
+        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(routine.enabled ? t.foreground : t.muted).child(routine.name))
+        .child(status.flex_none().text_size(11).text_color(isRunning ? t.working : t.dim));
+    });
+    const list = v_flex().id(`routines-list-${key}`).flex_none().gap(1)
+      .when(maxHeight !== null, (el) => el.max_h(maxHeight).overflow_y_scrollbar())
+      .children(rows);
+    return v_flex().id(`routines-${key}`).flex_none().pb(4)
+      .child(h_flex().id(`routines-title-${key}`).h(24).flex_none().px(8).gap(6).items_center().rounded(6)
+        .text_size(11).font_medium().text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
+        .tooltip(`Ouvrir les routines de ${machine ?? "cet ordinateur"}`)
+        .on_click(() => openRoutinesScreen(machine))
+        .child("Routines")
+        .child(div().px(5).h(15).rounded(4).bg(t.accent + "26").text_size(10.5).font_semibold().text_color(t.accent).flex().items_center().child(String(routines.length))))
+      .child(list);
   }
 
   emptyWorkspace(machine, ws, t, collapsed) {
@@ -1400,7 +1459,7 @@ export default class Spaces extends View {
 
   // Sets this.activeAt to where the active space's row lands among the children this returns: the list
   // scrolls by its direct children, and machine headers, login notes, workspace tabs and loading rows count too.
-  // With only this computer known there is no header, and render() draws its tabs above the list.
+  // With only this computer known there is no header, and render() draws its routines and tabs above the list.
   machineItems(machineNames, rowsOfMachine, section, t, collapsed, childIndexOf) {
     this.activeAt = -1;
     let before = 0;
@@ -1470,12 +1529,14 @@ export default class Spaces extends View {
             .text_size(11).text_color(t.foreground).bg(t.raised).cursor_pointer().hover(s => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(login); this.copiedLogin = login; cx.notify(); })
             .child(this.copiedLogin === login ? "Copied" : "Copy")))] : [];
+      const routinesSection = folded || collapsed ? null : this.routinesSection(m, t);
+      const routines = routinesSection ? [routinesSection] : [];
       const tabs = !folded && readWorkspaces(m).enabled ? [this.workspaceTabs(m, mine, t, collapsed)] : [];
       const { shown, items: spaceItems } = section(m);
       const body = folded ? [] : mine.length ? spaceItems : [loading(m) ? loadingRow(m) : cell(empty)];
-      const items = [cell(head), ...guidance, ...tabs, ...body];
+      const items = [cell(head), ...guidance, ...routines, ...tabs, ...body];
       const first = folded ? -1 : childIndexOf(shown, shown.findIndex(r => r.w.active));
-      if (first >= 0) this.activeAt = before + 1 + guidance.length + tabs.length + first;
+      if (first >= 0) this.activeAt = before + 1 + guidance.length + routines.length + tabs.length + first;
       before += items.length;
       return items;
     });
@@ -1654,6 +1715,7 @@ export default class Spaces extends View {
     if (changed) setShared("space.colors", kept);
     const list = this.grouped(t, collapsed);
     const onlyThisComputer = this.remoteMachines(this.lastRows).length === 0;
+    const thisComputerRoutines = onlyThisComputer && !collapsed ? this.routinesSection(null, t, { maxHeight: ROUTINES_LIST_MAX_HEIGHT }) : null;
     // Bring the active space into view when it, or its place in the list, changes; a row already in view stays put.
     const active = sp.find(p => p.active)?.id;
     if (active !== this.revealed || this.activeAt !== this.revealedAt) {
@@ -1680,7 +1742,8 @@ export default class Spaces extends View {
           .child(svg(`mods/benni-spaces/chevrons-${this.allSpacesFolded() ? "up-down" : "down-up"}.svg`).size(14))))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => this.newSpaceOn(sp.find((p) => p.active)?.machine ?? null)).child(svg("mods/workspace-chrome/plus.svg").size(14))))
-      // With only this computer known, its tabs stay above the list; otherwise each machine's sit under its header.
+      // With only this computer known, its routines and tabs stay above the list; otherwise each machine's sit under its header.
+      .when(Boolean(thisComputerRoutines), (el) => el.child(div().px(8).flex_none().child(thisComputerRoutines)))
       .when(onlyThisComputer && readWorkspaces(null).enabled, (el) => el.child(this.workspaceTabs(null, this.lastRows, t, collapsed)))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
