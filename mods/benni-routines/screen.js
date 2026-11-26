@@ -267,7 +267,7 @@ export class RoutinesScreen {
       try {
         await changeRoutines(machine, (store) => {
           const index = store.routines.findIndex((r) => r.id === routine.id);
-          if (index >= 0) store.routines[index] = routine;
+          if (index >= 0) store.routines[index] = { ...routine, enabled: store.routines[index].enabled };
           else store.routines.push(routine);
         });
       } catch (error) {
@@ -790,7 +790,6 @@ export class RoutinesScreen {
           .child(this.field("Modèle", this.modelSelect(t, draft)))
           .child(this.field("Effort", this.effortPicker(t), "« Défaut » laisse --effort de côté.")))
         .child(this.field("Options", v_flex().gap(10)
-          .child(this.optionRow("editor-enabled", "Activée", "Une routine désactivée ne se lance ni sur planning ni à la main.", draft.enabled, () => { draft.enabled = !draft.enabled; }))
           .child(this.optionRow("editor-worktree", "Worktree", "Un nouveau worktree par run, basé sur origin/HEAD.", draft.worktree, () => { draft.worktree = !draft.worktree; }))
           .child(this.optionRow("editor-print", "Mode -p", "claude -p : non interactif, cet écran lit sa sortie ; « Ouvrir » reprend la conversation.", draft.print, () => { draft.print = !draft.print; }))
           .child(this.optionRow("editor-toast", "Toast à la fin", "Une notification Herdr quand le run se termine ou échoue.", draft.toast, () => { draft.toast = !draft.toast; }))
