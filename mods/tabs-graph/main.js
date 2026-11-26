@@ -52,7 +52,8 @@ export default class Tabs extends View {
     const stop = (_e, cx) => cx.stop_propagation();
     const update = shared("benni.update"); // written by benni-spaces and benni-settings: { installed, latest }
     const updateAvailable = !!(update?.installed && update.latest && update.installed !== update.latest);
-    const runningRoutines = (shared("benni.routines")?.runs ?? []).filter(r => r.status === "running").length; // written by benni-routines
+    // Every machine's runs, as benni-routines last read them: { [machine]: { runs, ... } }.
+    const runningRoutines = Object.values(shared("benni.machines.routines") ?? {}).flatMap(store => store?.runs ?? []).filter(r => r.status === "running").length;
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const item = (c, i) => {

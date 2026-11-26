@@ -1,10 +1,10 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, shared } from "herdr";
-import { readStore, updateStore, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
-import { PRESETS, WEEKDAYS, describeSchedule, scheduleError, scheduleCron, nextRunOf, formatWhen, formatDuration, minuteKey } from "./schedule.js";
+import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, machines } from "herdr";
+import { readStore, readAllStores, changeRoutines, changeRuns, syncStore, storeState, clockOf, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
+import { PRESETS, WEEKDAYS, describeSchedule, scheduleError, scheduleCron, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
 import { startRun, purgeOldRuns, focusRunTab, resumeInTab, closeRunTab, cleanWorktree, removeRunFiles } from "./runs.js";
-import { workColumnBounds, RUN_TO_SHOW_KEY } from "./scheduler.js";
+import { workColumnBounds, runToShow } from "./scheduler.js";
 
 const SPINNER = "mods/workspace-chrome/spinner.svg";
 const CLOCK = "mods/workspace-chrome/clock.svg";
@@ -23,7 +23,9 @@ export class RoutinesScreen {
   init(cx) {
     this.handle = cx.focus_handle();
     this.handle.focus();
-    const shownRun = readStore().runs.find((r) => r.id === props()?.runId);
+    const target = props()?.target ?? null;
+    this.machine = target?.machine ?? null; // whose routines and runs show: null is this computer
+    const shownRun = readStore(this.machine).runs.find((r) => r.id === target?.run);
     this.filter = null;
     this.expandedRun = shownRun?.print ? shownRun.id : null;
     this.highlightedRun = shownRun?.id ?? null;
@@ -50,13 +52,21 @@ export class RoutinesScreen {
       for (;;) {
         const command = await nextCommand();
         if (command === "close") { this.close(); return; }
-        if (command === "open-run") this.showRun(shared(RUN_TO_SHOW_KEY), cx);
+        if (command === "open-run") this.showRun(runToShow(), cx);
       }
     });
+    this.reload(cx);
   }
 
-  showRun(runId, cx) {
-    const record = readStore().runs.find((r) => r.id === runId);
+  reload(cx) {
+    const machine = this.machine;
+    cx.spawn(async (cx) => { await syncStore(machine); cx.notify(); });
+  }
+
+  showRun(target, cx) {
+    if (!target) return;
+    this.chooseMachine(target.machine, cx);
+    const record = readStore(this.machine).runs.find((r) => r.id === target.run);
     if (!record) return;
     this.editing = null;
     this.filter = null;
@@ -67,6 +77,40 @@ export class RoutinesScreen {
 
   close() {
     closeOverlay(props().overlay);
+  }
+
+  // This computer, then every machine Herdr knows or whose routines were read.
+  machineChoices() {
+    const names = new Set([...machines().map((m) => m.name).filter(Boolean), ...readAllStores().map(([machine]) => machine).filter(Boolean)]);
+    if (this.machine) names.add(this.machine);
+    return [null, ...[...names].sort()];
+  }
+
+  chooseMachine(machine, cx) {
+    if (machine === this.machine) return;
+    this.machine = machine;
+    this.filter = null;
+    this.editing = null;
+    this.expandedRun = null;
+    this.highlightedRun = null;
+    this.confirmingRunDelete = null;
+    this.note = null;
+    this.reload(cx);
+    cx.notify();
+  }
+
+  // Another machine's routines change only while it is connected and read; otherwise they show read only.
+  reach() {
+    const { state, error } = storeState(this.machine);
+    const layout = this.machine ? machines().find((m) => m.name === this.machine)?.layout : "ready";
+    if (layout === "ready" && state === "ready") return { writable: true, why: "" };
+    const why = layout === "loading" ? "en chargement" : layout !== "ready" ? "injoignable" : state === "unknown" ? "en lecture…" : `lecture impossible (${error})`;
+    return { writable: false, why: `${this.machine ?? "Cet ordinateur"} : ${why}. ${state === "unknown" ? "" : "Dernière copie connue, en lecture seule."}`.trim() };
+  }
+
+  /** Writes and reports a failure in the note line. */
+  persist(promise, cx) {
+    promise.catch((error) => { this.note = { text: `Enregistrement impossible : ${error?.message ?? error}`, error: true }; cx.notify(); });
   }
 
   // The screen was sized for the window and sidebar it opened over.
@@ -95,6 +139,7 @@ export class RoutinesScreen {
   // --- Editing ---------------------------------------------------------------------------------
 
   startEditing(routine, cx) {
+    if (!this.reach().writable) return;
     const draft = routine ? JSON.parse(JSON.stringify(routine)) : blankRoutine();
     this.editing = { draft, isNew: !routine };
     this.formError = "";
@@ -138,19 +183,28 @@ export class RoutinesScreen {
       : !routine.folder ? "Choisis un répertoire."
       : scheduleError(routine.schedule) ? `Planification : ${scheduleError(routine.schedule)}.` : "";
     if (problem) { this.formError = problem; cx.notify(); return; }
+    const machine = this.machine;
     cx.spawn(async (cx) => {
-      const exists = (await exec("test", ["-d", routine.folder])).code === 0;
-      if (!exists) { this.formError = `Répertoire introuvable : ${routine.folder}`; cx.notify(); return; }
-      if (routine.worktree && (await exec("git", ["rev-parse", "--show-toplevel"], { cwd: routine.folder })).code !== 0) {
+      // The folder is on the routine's machine: checked there.
+      const exists = await exec("test", ["-d", routine.folder], { on: machine }).then((r) => r.code === 0, () => null);
+      if (exists === null) { this.formError = `${machine} ne répond pas : impossible de vérifier le répertoire.`; cx.notify(); return; }
+      if (!exists) { this.formError = `Répertoire introuvable${machine ? ` sur ${machine}` : ""} : ${routine.folder}`; cx.notify(); return; }
+      if (routine.worktree && (await exec("git", ["rev-parse", "--show-toplevel"], { cwd: routine.folder, on: machine })).code !== 0) {
         this.formError = "Worktree coché, mais ce répertoire n'est pas dans un dépôt git."; cx.notify(); return;
       }
       // A preset keeps its cron too, so "Avancé" opens on the same schedule.
       routine.schedule.cron = scheduleCron(routine.schedule);
-      updateStore((store) => {
-        const index = store.routines.findIndex((r) => r.id === routine.id);
-        if (index >= 0) store.routines[index] = { ...routine, lastFired: store.routines[index].lastFired };
-        else store.routines.push(routine);
-      });
+      // Saved during a minute it matches: that minute is not run late.
+      routine.armedAt = startOfMinute(Date.now());
+      try {
+        await changeRoutines(machine, (store) => {
+          const index = store.routines.findIndex((r) => r.id === routine.id);
+          if (index >= 0) store.routines[index] = routine;
+          else store.routines.push(routine);
+        });
+      } catch (error) {
+        this.formError = `Enregistrement impossible : ${error?.message ?? error}`; cx.notify(); return;
+      }
       this.editing = null;
       this.filter = routine.id;
       this.handle.focus();
@@ -159,7 +213,7 @@ export class RoutinesScreen {
   }
 
   deleteRoutine(routineId, cx) {
-    updateStore((store) => { store.routines = store.routines.filter((r) => r.id !== routineId); });
+    this.persist(changeRoutines(this.machine, (store) => { store.routines = store.routines.filter((r) => r.id !== routineId); }), cx);
     this.editing = null;
     this.confirmingRoutineDelete = false;
     if (this.filter === routineId) this.filter = null;
@@ -177,23 +231,25 @@ export class RoutinesScreen {
   // --- Actions on routines and runs -----------------------------------------------------------
 
   setEnabled(routineId, enabled, cx) {
-    updateStore((store) => {
+    if (!this.reach().writable) return;
+    this.persist(changeRoutines(this.machine, (store) => {
       const routine = store.routines.find((r) => r.id === routineId);
       // Turned back on during a minute it matches: that minute is not run late.
-      if (routine) { routine.enabled = enabled; if (enabled) routine.lastFired = minuteKey(new Date()); }
-    });
+      if (routine) { routine.enabled = enabled; if (enabled) routine.armedAt = startOfMinute(Date.now()); }
+    }), cx);
     cx.notify();
   }
 
   launchNow(routine, cx) {
-    if (!routine.enabled || this.busy.has(routine.id)) return;
+    if (!routine.enabled || this.busy.has(routine.id) || !this.reach().writable) return;
+    const machine = this.machine;
     this.busy.add(routine.id);
     this.filter = routine.id;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        await startRun(routine, { manual: true });
-        await purgeOldRuns(routine);
+        await startRun(machine, routine, { manual: true });
+        await purgeOldRuns(machine, routine);
       } catch (error) {
         this.note = { text: `Lancement impossible : ${error?.message ?? error}`, error: true };
       } finally {
@@ -214,28 +270,30 @@ export class RoutinesScreen {
   }
 
   goToTab(record, cx) {
-    if (focusRunTab(record)) this.close();
+    if (focusRunTab(this.machine, record)) this.close();
     else { this.note = { text: "L'onglet de ce run est fermé.", error: true }; cx.notify(); }
   }
 
   resume(record, cx) {
+    const machine = this.machine;
     cx.spawn(async (cx) => {
-      const problem = await resumeInTab(record);
+      const problem = await resumeInTab(machine, record);
       if (problem) { this.note = { text: `Reprise impossible : ${problem}`, error: true }; cx.notify(); }
       else this.close();
     });
   }
 
   deleteRun(record, withWorktree, cx) {
+    const machine = this.machine;
     this.confirmingRunDelete = null;
-    closeRunTab(record);
-    updateStore((store) => { store.runs = store.runs.filter((r) => r.id !== record.id); });
+    closeRunTab(machine, record);
+    this.persist(changeRuns(machine, (data) => { data.runs = data.runs.filter((r) => r.id !== record.id); }), cx);
     cx.notify();
     cx.spawn(async (cx) => {
-      await removeRunFiles(record).catch(() => {});
+      await removeRunFiles(machine, record).catch(() => {});
       if (!withWorktree || !record.worktree) return;
       try {
-        const kept = await cleanWorktree(record.worktree);
+        const kept = await cleanWorktree(machine, record.worktree);
         this.note = kept
           ? { text: `Worktree gardé (${kept}) : ${record.worktree.path}`, error: true }
           : { text: `Worktree et branche ${record.worktree.branch} supprimés.`, error: false };
@@ -250,8 +308,9 @@ export class RoutinesScreen {
 
   render(cx) {
     const t = theme();
-    const { routines, runs } = readStore();
+    const { routines, runs } = readStore(this.machine);
     const running = runs.filter((r) => r.status === "running").length;
+    const { writable, why } = this.reach();
     return v_flex().id("routines-screen").size_full().bg(t.canvas).text_color(t.foreground).text_size(13)
       .track_focus(this.handle).on_key_down((e, cx) => this.onKey(e, cx))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -260,14 +319,33 @@ export class RoutinesScreen {
         .child(div().text_size(14).font_semibold().child("Routines"))
         .child(div().text_size(11.5).text_color(t.dim)
           .child(`${routines.length} routine${routines.length > 1 ? "s" : ""}${running ? ` · ${running} en cours` : ""}`))
+        .child(this.machinePicker(t))
         .child(div().flex_1())
         .child(div().text_size(11).text_color(t.dim).child("Esc pour fermer"))
         .child(h_flex().id("routines-close").size(26).flex_none().items_center().justify_center().rounded(6).text_color(t.dim)
           .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Fermer (Esc)")
           .on_click(() => this.close()).child(svg(CLOSE).size(12))))
+      .when(!writable, (el) => el.child(div().flex_none().mx(8).mt(8).px(10).py(6).rounded(7).bg(t.ansi1 + "12").border_1().border_color(t.ansi1 + "55")
+        .text_size(11.5).text_color(t.ansi1).child(why)))
       .child(h_flex().flex_1().min_h(0).p(8).gap(8).items_start()
         .child(this.routineList(routines, runs, t))
         .child(this.editing ? this.editor(t) : this.history(routines, runs, t)));
+  }
+
+  machinePicker(t) {
+    const choices = this.machineChoices();
+    if (choices.length < 2) return div();
+    return h_flex().gap(4).items_center().children(choices.map((machine) => {
+      const chosen = machine === this.machine;
+      const connected = !machine || machines().find((m) => m.name === machine)?.layout === "ready";
+      return h_flex().id(`routines-machine-${machine ?? "local"}`).h(24).px(8).gap(5).flex_none().items_center().rounded(6).border_1()
+        .border_color(chosen ? t.accent : t.border).bg(chosen ? t.selected : t.surface)
+        .text_size(11.5).text_color(chosen ? t.foreground : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => this.chooseMachine(machine, cx))
+        .child(svg(`mods/workspace-chrome/${machine ? "server" : "monitor"}.svg`).size(12).flex_none())
+        .child(machine ?? "Cet ordinateur")
+        .when(Boolean(machine), (el) => el.child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim)));
+    }));
   }
 
   card(id) {
@@ -334,7 +412,8 @@ export class RoutinesScreen {
   routineCard(routine, runs, t) {
     const selected = this.filter === routine.id || this.editing?.draft.id === routine.id;
     const isRunning = runs.some((r) => r.routine === routine.id && r.status === "running");
-    const next = routine.enabled ? nextRunOf(routine.schedule) : null;
+    const machineClock = clockOf(this.machine);
+    const next = routine.enabled && machineClock ? nextRunOf(routine.schedule, machineClock) : null;
     const tags = [routine.print ? "-p" : "interactif", routine.worktree ? "worktree" : null, MODELS.find((m) => m.id === routine.model)?.label].filter(Boolean);
     const launching = this.busy.has(routine.id);
     return v_flex().id(`routine-${routine.id}`).flex_none().p(10).gap(4).rounded(8).border_1()
@@ -486,7 +565,8 @@ export class RoutinesScreen {
     const draft = this.editing.draft;
     const schedule = this.draftSchedule();
     const problem = scheduleError(schedule);
-    const next = problem ? null : nextRunOf(schedule);
+    const machineClock = clockOf(this.machine);
+    const next = problem || !machineClock ? null : nextRunOf(schedule, machineClock);
     const timeRow = h_flex().gap(8).items_center().text_size(12).text_color(t.muted).child("à").child(this.input(this.timeInput, t, 80));
     return v_flex().gap(8)
       .child(this.chips("schedule-kind", PRESETS, schedule.kind, (kind) => { draft.schedule.kind = kind; }))
@@ -519,8 +599,9 @@ export class RoutinesScreen {
         .child(this.field("Prompt", Textarea.new(this.promptInput).w_full().px(10).py(8).rounded(7).border_1().border_color(t.input)
           .bg(t.background).text_size(12.5).text_color(t.foreground)))
         .child(this.field("Planification", this.scheduleEditor(t)))
-        .child(this.field("Répertoire", h_flex().gap(6).child(this.input(this.folderInput, t))
-          .child(this.textButton("editor-pick-folder", "Choisir…", "plain", (cx) => this.chooseFolder(cx))),
+        .child(this.field(this.machine ? `Répertoire sur ${this.machine}` : "Répertoire", h_flex().gap(6).child(this.input(this.folderInput, t))
+          // The system's folder picker only sees this computer: another machine's folder is typed, then checked there.
+          .when(!this.machine, (el) => el.child(this.textButton("editor-pick-folder", "Choisir…", "plain", (cx) => this.chooseFolder(cx)))),
           draft.worktree ? "Chaque run part d'un nouveau worktree de ce dépôt, sur une branche routine-…" : "La session tourne dans ce répertoire tel quel."))
         .child(h_flex().gap(24).items_start()
           .child(this.field("Modèle", this.chips("editor-model", MODELS, draft.model, (id) => { draft.model = id; })))

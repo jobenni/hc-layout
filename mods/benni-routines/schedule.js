@@ -1,8 +1,36 @@
-// Five-field cron (minute hour day-of-month month day-of-week), local time, and the presets the
-// editor offers on top of it.
+// Five-field cron (minute hour day-of-month month day-of-week) in the local time of the routine's
+// machine, and the presets the editor offers on top of it.
+//
+// Matching works on a machine's "wall clock": a Date whose UTC fields read that machine's local time
+// (toWall), so two clients in different time zones compute the same minutes. formatWhen and
+// formatDuration show real times in this client's own time.
 
 const FIELD_RANGES = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
 const MINUTE_MS = 60000;
+
+/** This computer's clock: its own time zone, daylight saving included. */
+export const localClock = {
+  toWall: (time) => new Date(time - new Date(time).getTimezoneOffset() * MINUTE_MS),
+  toTime(wall) {
+    const guess = wall.getTime() + new Date(wall.getTime()).getTimezoneOffset() * MINUTE_MS;
+    return wall.getTime() + new Date(guess).getTimezoneOffset() * MINUTE_MS;
+  },
+};
+
+/** Another machine's clock, from its UTC offset in minutes (`date +%z`, read again every hour). */
+export function offsetClock(offsetMinutes) {
+  return {
+    toWall: (time) => new Date(time + offsetMinutes * MINUTE_MS),
+    toTime: (wall) => wall.getTime() - offsetMinutes * MINUTE_MS,
+  };
+}
+
+/** "+0100" -> 60, "-0430" -> -270, or null. */
+export function parseUtcOffset(text) {
+  const match = /^([+-])(\d\d)(\d\d)$/.exec((text ?? "").trim());
+  if (!match) return null;
+  return (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3]));
+}
 const SEARCH_LIMIT_DAYS = 366 * 5;
 
 export const PRESETS = [
@@ -56,36 +84,37 @@ export function cronError(expression) {
 }
 
 // As in cron: when both the day of month and the day of week are restricted, either one matches.
-function dayMatches(cron, date) {
-  const byDay = cron.days.has(date.getDate());
-  const byWeekday = cron.weekdays.has(date.getDay());
+function dayMatches(cron, wall) {
+  const byDay = cron.days.has(wall.getUTCDate());
+  const byWeekday = cron.weekdays.has(wall.getUTCDay());
   if (cron.anyDay) return byWeekday;
   if (cron.anyWeekday) return byDay;
   return byDay || byWeekday;
 }
 
-export function cronMatches(cron, date) {
-  return cron.minutes.has(date.getMinutes()) && cron.hours.has(date.getHours())
-    && cron.months.has(date.getMonth() + 1) && dayMatches(cron, date);
+/** `wall`: a wall-clock Date (see toWall). */
+export function cronMatches(cron, wall) {
+  return cron.minutes.has(wall.getUTCMinutes()) && cron.hours.has(wall.getUTCHours())
+    && cron.months.has(wall.getUTCMonth() + 1) && dayMatches(cron, wall);
 }
 
-/** The first matching minute strictly after `after`, or null. */
+/** The first matching wall-clock minute strictly after the wall-clock `after`, or null. */
 export function nextOccurrence(cron, after) {
   const date = new Date(after.getTime());
-  date.setSeconds(0, 0);
-  date.setMinutes(date.getMinutes() + 1);
+  date.setUTCSeconds(0, 0);
+  date.setUTCMinutes(date.getUTCMinutes() + 1);
   const limit = after.getTime() + SEARCH_LIMIT_DAYS * 86400000;
   while (date.getTime() < limit) {
-    if (!cron.months.has(date.getMonth() + 1)) { date.setMonth(date.getMonth() + 1, 1); date.setHours(0, 0); continue; }
-    if (!dayMatches(cron, date)) { date.setDate(date.getDate() + 1); date.setHours(0, 0); continue; }
-    if (!cron.hours.has(date.getHours())) { date.setHours(date.getHours() + 1, 0); continue; }
-    if (!cron.minutes.has(date.getMinutes())) { date.setMinutes(date.getMinutes() + 1); continue; }
+    if (!cron.months.has(date.getUTCMonth() + 1)) { date.setUTCMonth(date.getUTCMonth() + 1, 1); date.setUTCHours(0, 0); continue; }
+    if (!dayMatches(cron, date)) { date.setUTCDate(date.getUTCDate() + 1); date.setUTCHours(0, 0); continue; }
+    if (!cron.hours.has(date.getUTCHours())) { date.setUTCHours(date.getUTCHours() + 1, 0); continue; }
+    if (!cron.minutes.has(date.getUTCMinutes())) { date.setUTCMinutes(date.getUTCMinutes() + 1); continue; }
     return date;
   }
   return null;
 }
 
-/** Matching minutes in (from, to), oldest first, at most `cap`. */
+/** Matching wall-clock minutes in (from, to), oldest first, at most `cap`. */
 export function occurrencesBetween(cron, from, to, cap) {
   const found = [];
   let cursor = from;
@@ -96,11 +125,6 @@ export function occurrencesBetween(cron, from, to, cap) {
     cursor = next;
   }
   return found;
-}
-
-export function minuteKey(date) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 export function startOfMinute(time) {
@@ -150,22 +174,28 @@ export function describeSchedule(schedule) {
   }
 }
 
-export function nextRunOf(schedule, after = new Date()) {
-  try { return nextOccurrence(parseCron(scheduleCron(schedule)), after); } catch { return null; }
+/** The next real time a schedule runs on a machine with `machineClock`, or null. */
+export function nextRunOf(schedule, machineClock = localClock, after = Date.now()) {
+  try {
+    const wall = nextOccurrence(parseCron(scheduleCron(schedule)), machineClock.toWall(after));
+    return wall ? new Date(machineClock.toTime(wall)) : null;
+  } catch { return null; }
 }
 
 const pad2 = (n) => String(n).padStart(2, "0");
-const clock = (date) => `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+const localClockText = (date) => `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+/** "14:05" on a wall-clock Date. */
+const clock = (wall) => `${pad2(wall.getUTCHours())}:${pad2(wall.getUTCMinutes())}`;
 
 /** "aujourd'hui 14:05", "demain 09:00", "lun. 3 déc. 09:00". */
 export function formatWhen(time, now = new Date()) {
   const date = new Date(time);
   const dayDiff = Math.round((new Date(date).setHours(0, 0, 0, 0) - new Date(now).setHours(0, 0, 0, 0)) / 86400000);
-  if (dayDiff === 0) return `aujourd'hui ${clock(date)}`;
-  if (dayDiff === 1) return `demain ${clock(date)}`;
-  if (dayDiff === -1) return `hier ${clock(date)}`;
+  if (dayDiff === 0) return `aujourd'hui ${localClockText(date)}`;
+  if (dayDiff === 1) return `demain ${localClockText(date)}`;
+  if (dayDiff === -1) return `hier ${localClockText(date)}`;
   const year = date.getFullYear() !== now.getFullYear() ? ` ${date.getFullYear()}` : "";
-  return `${DAY_NAMES[date.getDay()]} ${date.getDate()} ${MONTH_NAMES[date.getMonth()]}${year} ${clock(date)}`;
+  return `${DAY_NAMES[date.getDay()]} ${date.getDate()} ${MONTH_NAMES[date.getMonth()]}${year} ${localClockText(date)}`;
 }
 
 export function formatDuration(ms) {
@@ -177,8 +207,9 @@ export function formatDuration(ms) {
   return `${Math.floor(minutes / 60)}h ${pad2(minutes % 60)}m`;
 }
 
-export function compactStamp(date) {
-  return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-${pad2(date.getHours())}${pad2(date.getMinutes())}`;
+/** "20261126-0905" on a wall-clock Date. */
+export function compactStamp(wall) {
+  return `${wall.getUTCFullYear()}${pad2(wall.getUTCMonth() + 1)}${pad2(wall.getUTCDate())}-${pad2(wall.getUTCHours())}${pad2(wall.getUTCMinutes())}`;
 }
 
 export { clock };

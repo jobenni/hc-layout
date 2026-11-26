@@ -6,7 +6,7 @@
 // A read says, per file, its text or null when the file is absent; it throws when it can't tell
 // (machine unreachable or still loading), so callers keep what they knew and write nothing.
 
-import { exec, readTextFile, writeTextFile, appHome, machines } from "herdr";
+import { exec, readTextFile, writeTextFile, appHome, home, machines } from "herdr";
 
 /** shared() keys can't be null: this computer is "". */
 export const machineKey = (machine) => machine ?? "";
@@ -63,6 +63,23 @@ const SEND_TO_MACHINE = [
   'rm -f "$incoming" ${previous:+"$previous"}',
   "exit $status",
 ].join("\n");
+
+const homes = new Map(); // machine -> its home, asked once
+
+/** A machine's home folder (here: home()); throws when the machine can't say. */
+export async function machineHome(machine) {
+  if (!machine) return home();
+  if (homes.has(machine)) return homes.get(machine);
+  const result = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine, timeout: PROBE_TIMEOUT_MS });
+  if (result.code !== 0 || !result.stdout) throw new Error(`dossier personnel introuvable sur ${machine}`);
+  homes.set(machine, result.stdout);
+  return result.stdout;
+}
+
+/** A machine's Herdr app folder: appHome() here, ~/.config/herdr-app there. */
+export async function machineAppDir(machine) {
+  return machine ? `${await machineHome(machine)}/${REMOTE_APP_DIR}` : appHome();
+}
 
 export class StaleWrite extends Error {
   constructor(name) {
