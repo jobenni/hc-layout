@@ -5,7 +5,6 @@ import { readRuns, readSteps, readTranscript, transcriptFile, phasesWithSteps } 
 
 const FALLBACK_REFRESH_MS = 5000;
 const EVENTS_PER_PAGE = 200;
-const RESULT_PREVIEW_LINES = 3;
 const PROMPT_PREVIEW_LINES = 3;
 const OUTCOME_PREVIEW_LINES = 14;
 const END_TOLERANCE_PX = 40;
@@ -32,6 +31,11 @@ function shortModel(model) {
 
 function linesOf(text) {
   return (text ?? "").replace(/\s+$/, "").split("\n");
+}
+
+function collapsedResultLabel(lines) {
+  const count = lines.length === 1 && lines[0] === "" ? 0 : lines.length;
+  return count === 0 ? "(aucune sortie)" : `${count} ligne${count > 1 ? "s" : ""} · déplier`;
 }
 
 function stateColor(t, state) {
@@ -372,7 +376,6 @@ export class WorkflowViewer {
     const bullet = waiting ? svg(SPINNER).size(11).text_color(t.working).spin(900)
       : div().text_color(result?.error ? t.ansi1 : t.ansi2).child("⏺");
     const lines = result ? linesOf(result.text) : [];
-    const shown = open ? lines : lines.slice(0, RESULT_PREVIEW_LINES);
     return v_flex().id(`wf-tool-${key}`).gap(2).on_click((_e, cx) => this.toggle(key, cx))
       .child(h_flex().items_start().gap(8)
         .child(h_flex().flex_none().w(12).h(18).items_center().child(bullet))
@@ -382,8 +385,7 @@ export class WorkflowViewer {
       .when(Boolean(result), (el) => el.child(h_flex().items_start().gap(8).pl(4)
         .child(div().flex_none().w(16).text_color(t.dim).child("⎿"))
         .child(v_flex().flex_1().min_w(0).font_family(mono).text_size(12).text_color(result.error ? t.ansi1 : t.dim)
-          .child(shown.join("\n") || "(aucune sortie)")
-          .when(!open && lines.length > shown.length, (el) => el.child(div().text_color(t.dim).child(`… +${lines.length - shown.length} lignes`))))));
+          .child(open ? lines.join("\n") || "(aucune sortie)" : collapsedResultLabel(lines)))));
   }
 
   outcomeView(t, step, mono, cx) {

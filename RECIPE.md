@@ -110,7 +110,7 @@ Left to right: a 268px sidebar, then the work column.
   - A click veils the tab area (black at `a6` alpha, `59` in light themes, a click there closes) and centers on it a card 90% of its width and height: background `popover`, 1px `input` border, 10px corners, a large shadow.
   - Header on `chrome`: name in `accent`, description, "En cours"/"Terminé · N/M agents", a close cross.
   - Left (260px): every phase of the script, done ones `✔` in `ansi2`, running ones with a spinner, not started ones numbered in `dim`, each with its agents (status mark, label, model).
-  - Right: the selected agent, live like a Claude Code session: the prompt collapsed in a card, `⏺` assistant text as Markdown, `∴ Réflexion` collapsed, `⏺ Tool(summary)` (spinner until its result, `ansi1` on error) with `⎿` and the first 3 result lines, then the outcome JSON once done.
+  - Right: the selected agent, live like a Claude Code session: the prompt collapsed in a card, `⏺` assistant text as Markdown, `∴ Réflexion` collapsed, `⏺ Tool(summary)` (spinner until its result, `ansi1` on error) with its result collapsed to `⎿ N lignes · déplier` (`(aucune sortie)` when empty); a click on the row shows the whole output and the full call line, then the outcome JSON once done.
   - It opens on the newest running agent and follows it until one is picked; a click or ↑/↓ (j/k) picks one; clicking a tool, the prompt or the outcome unfolds it; the transcript keeps to its end while it was scrolled there; 200 events at a time with "Afficher N événements précédents". Esc or the cross closes it, and so does showing another tab or space.
 
 ## Built from
