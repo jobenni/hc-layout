@@ -275,6 +275,10 @@ const WORKSPACES_RELOAD = 20000;
 
 const workspaceDropKey = (machine, workspaceId) => `ws:${machineKey(machine)}:${workspaceId}`;
 // The settings open on the workspaces of the machine whose tab was right-clicked (benni-settings reads this key).
+// The Routines screen covers the work column: a session or space picked here closes it, even the one already focused.
+const showPane = (pane) => { run("benni-routines.close"); run("pane.focus", { pane }); };
+const showSpace = (id) => { run("benni-routines.close"); run("space.select", { id }); };
+
 const SETTINGS_MACHINE_KEY = "benni.settings.machine";
 const openSettings = (machine) => {
   setShared(SETTINGS_MACHINE_KEY, machineKey(machine));
@@ -737,7 +741,7 @@ export default class Spaces extends View {
       .cursor_pointer()
       .when(a.focused, (el) => el.bg(t.selected))
       .when(!a.focused, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click(() => run("pane.focus", { pane: a.pane }))
+      .on_click(() => showPane(a.pane))
       .when(Boolean(pic), (el) => el.child(pic))
       .child(div().flex_1().min_w(0).truncate().text_color(quiet ? t.muted : t.foreground).child(a.sessionName))
       .when(Boolean(since), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(elapsed(Date.now() - since))))
@@ -1020,7 +1024,7 @@ export default class Spaces extends View {
       .bg(tint + (a.focused ? "22" : "0d"))
       .cursor_pointer()
       .hover((s) => s.bg(tint + "1c"))
-      .on_click(() => run("pane.focus", { pane: a.pane }))
+      .on_click(() => showPane(a.pane))
       .child(h_flex().gap(SESSION_GAP).items_center()
         .child(this.spaceMark(a.space, a.space_name, 16))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(a.sessionName))
@@ -1130,7 +1134,7 @@ export default class Spaces extends View {
       .cursor_pointer()
       .hover((s) => s.bg(tint + "1c"))
       .tooltip(label)
-      .on_click(() => run("pane.focus", { pane: a.pane }))
+      .on_click(() => showPane(a.pane))
       .child(this.spaceMark(a.space, a.space_name, RAIL_SESSION_AVATAR))
       .child(div().absolute().right(0).bottom(0).rounded(5).bg(t.chrome).p(1).child(this.agentStatus(t, a.status))));
   }
@@ -1173,7 +1177,7 @@ export default class Spaces extends View {
       .cursor_pointer()
       .when(p.focused, (el) => el.bg(t.selected))
       .when(!p.focused, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click(() => run("pane.focus", { pane: p.pane }))
+      .on_click(() => showPane(p.pane))
       .child(pic)
       .child(div().flex_1().min_w(0).truncate().text_color(p.focused || busy ? t.foreground : t.muted).child(name))
       .when(folder !== name, (el) => el.child(div().flex_none().max_w(110).truncate().text_size(11).text_color(t.dim).child(folder)));
@@ -1614,7 +1618,7 @@ export default class Spaces extends View {
       .items_center()
       .when(w.active, (el) => el.bg(t.selected))
       .when(!w.active, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click(() => run("space.select", { id: w.id }))
+      .on_click(() => showSpace(w.id))
       .child(div().text_color(w.active ? t.foreground : t.muted).child(String(i + 1)))
       .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));
   }
