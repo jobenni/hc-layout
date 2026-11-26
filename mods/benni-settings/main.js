@@ -5,8 +5,9 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, props, closeOverlay, theme, shared, setShared, exec, readTextFile, appHome, checking, notify } from "herdr";
-import { DEFAULT_WORKSPACE, readWorkspaces, workspaceOfSpace, changeWorkspaces, syncWorkspaces } from "./workspaces-store.js";
+import { spaces, machines, props, closeOverlay, theme, shared, setShared, exec, hc, readTextFile, appHome, checking, notify } from "herdr";
+import { machineOfKey } from "./machine-files.js";
+import { DEFAULT_WORKSPACE, WORKSPACES_CACHE_KEY, readWorkspaces, workspacesState, workspaceOfSpace, changeWorkspaces, syncWorkspaces } from "./workspaces-store.js";
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
@@ -32,6 +33,8 @@ async function readLatestCommit(branch) {
   return commit;
 }
 
+// benni-spaces names the machine whose workspace tab was right-clicked here.
+const SETTINGS_MACHINE_KEY = "benni.settings.machine";
 const SECTIONS = [
   { id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" },
   { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
@@ -80,11 +83,14 @@ export default class Settings extends View {
     this.renameInput = InputState.new({});
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
     this.update = { phase: "checking", branch: chosenBranch(), installed: null, latest: null, error: "" };
-    this.machine = null; // whose workspaces the section edits: null is this computer
+    this.machine = machineOfKey(shared(SETTINGS_MACHINE_KEY) ?? ""); // whose workspaces the section edits: null is this computer
+    setShared(SETTINGS_MACHINE_KEY, null);
+    this.machineList = []; // hc machine ls, without temporary machines
     this.saveError = "";
     this.handle.focus();
     if (checking()) return;
     this.reloadWorkspaces(cx);
+    this.listMachines(cx);
     this.checkForUpdate(cx);
     this.resumeRunningInstall(cx);
   }
@@ -167,9 +173,47 @@ export default class Settings extends View {
     cx.spawn(async (cx) => { await syncWorkspaces(machine); cx.notify(); });
   }
 
+  listMachines(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const r = await hc(["machine", "ls", "--json"]);
+        if (r.code === 0) this.machineList = (JSON.parse(r.stdout).machines ?? []).filter((m) => !m.temporary);
+      } catch {}
+      cx.notify();
+    });
+  }
+
+  // This computer first, then every machine by name: those hc knows and those already read.
+  machineChoices() {
+    const names = new Set([...this.machineList.map((m) => m.name), ...Object.keys(shared(WORKSPACES_CACHE_KEY) ?? {}).filter(Boolean)]);
+    if (this.machine) names.add(this.machine);
+    return [null, ...[...names].sort()];
+  }
+
+  chooseMachine(machine, cx) {
+    if (machine === this.machine) return;
+    this.machine = machine;
+    this.renaming = null;
+    this.deleting = null;
+    this.saveError = "";
+    this.reloadWorkspaces(cx);
+    cx.notify();
+  }
+
+  // Another machine is edited only while connected; otherwise its last known copy shows, read only.
+  machineReach(machine) {
+    if (!machine) return { writable: true, why: "" };
+    const layout = machines().find((m) => m.name === machine)?.layout;
+    const state = this.machineList.find((m) => m.name === machine)?.state;
+    if (layout === "ready") return { writable: true, why: "" };
+    const why = layout === "loading" ? "en chargement" : state && state !== "connected" ? state.replace(/_/g, " ") : "injoignable";
+    return { writable: false, why };
+  }
+
   // Every edit reads the machine's file again and writes it only if nobody changed it meanwhile.
   editWorkspaces(change, cx) {
     const machine = this.machine;
+    if (!this.machineReach(machine).writable) return;
     this.saveError = "";
     cx.spawn(async (cx) => {
       try { await changeWorkspaces(machine, change); }
@@ -187,6 +231,7 @@ export default class Settings extends View {
   }
 
   startRename(w, cx) {
+    if (!this.machineReach(this.machine).writable) return;
     this.renaming = w.id;
     this.deleting = null;
     this.renameInput.set_value(w.name);
@@ -286,7 +331,7 @@ export default class Settings extends View {
         : this.iconButton(`ws-rename-${w.id}`, "✎", "Renommer", t, (_e, cx) => this.startRename(w, cx)))
       .child(this.iconButton(`ws-delete-${w.id}`, "mods/git-graph/icons/trash.svg",
         isDefault ? "Le workspace par défaut accueille les spaces sans workspace : il ne se supprime pas" : "Supprimer",
-        t, (_e, cx) => { this.deleting = w.id; this.renaming = null; cx.notify(); }, { disabled: isDefault, danger: true }));
+        t, (_e, cx) => { this.deleting = w.id; this.renaming = null; cx.notify(); }, { disabled: isDefault || !this.machineReach(this.machine).writable, danger: true }));
   }
 
   workspacesSection(t) {
@@ -296,18 +341,42 @@ export default class Settings extends View {
       const ws = workspaceOfSpace(store, s.id);
       counts.set(ws, (counts.get(ws) ?? 0) + 1);
     }
+    const { writable, why } = this.machineReach(this.machine);
+    const { state, error } = workspacesState(this.machine);
+    const notice = !writable
+      ? `${this.machine} : ${why}. ${state === "unknown" ? "Ses workspaces n'ont jamais été lus." : "Dernière copie connue, en lecture seule."}`
+      : state === "offline" ? `Lecture impossible : ${error}` : "";
     return v_flex().gap(14)
-      .child(h_flex().gap(12).items_center()
+      .child(this.machinePicker(t))
+      .when(Boolean(notice), (el) => el.child(div().w_full().px(10).py(6).rounded(7).bg(t.blocked + "12").border_1().border_color(t.blocked + "55")
+        .text_size(11.5).text_color(t.blocked).child(notice)))
+      .child(h_flex().gap(12).items_center().when(!writable, (el) => el.opacity(0.5))
         .child(v_flex().flex_1().min_w(0).gap(3)
           .child(div().text_size(13).font_medium().text_color(t.foreground).child("Utiliser les workspaces"))
           .child(div().w_full().text_size(11.5).text_color(t.muted).child("Regroupe les spaces de la barre latérale (travail, perso…). Glisse un space sur un workspace pour l'y ranger.")))
         .child(this.toggle("ws-enabled", store.enabled, t, (_e, cx) => this.setEnabled(!store.enabled, cx))))
-      .child(v_flex().gap(6).when(!store.enabled, (el) => el.opacity(0.5))
+      .child(v_flex().gap(6).when(!store.enabled || !writable, (el) => el.opacity(0.5))
         .children(store.list.map((w, i) => this.workspaceRow(w, i, store, counts, t))))
-      .child(h_flex().gap(8).items_center().when(!store.enabled, (el) => el.opacity(0.5))
+      .child(h_flex().gap(8).items_center().when(!store.enabled || !writable, (el) => el.opacity(0.5))
         .child(Input.new(this.addInput).flex_1().h(30).px(10).rounded(7).border_1().border_color(t.input).bg(t.background).text_size(12.5).text_color(t.foreground))
         .child(this.textButton("ws-add", "Ajouter", true, t, (_e, cx) => this.addWorkspace(cx))))
       .when(Boolean(this.saveError), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.saveError)));
+  }
+
+  // "Cet ordinateur", then each machine: whose workspaces the section shows and edits.
+  machinePicker(t) {
+    const chip = (machine) => {
+      const chosen = machine === this.machine;
+      const { writable } = this.machineReach(machine);
+      return h_flex().id(`ws-machine-${machine ?? "local"}`).h(26).px(10).gap(6).flex_none().items_center().rounded(6).border_1()
+        .border_color(chosen ? t.accent : t.border).bg(chosen ? t.selected : t.surface)
+        .text_size(12).text_color(chosen ? t.foreground : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click((_e, cx) => this.chooseMachine(machine, cx))
+        .child(svg(`mods/workspace-chrome/${machine ? "server" : "monitor"}.svg`).size(12).flex_none())
+        .child(machine ?? "Cet ordinateur")
+        .when(Boolean(machine), (el) => el.child(div().size(6).rounded(3).flex_none().bg(writable ? t.ansi2 : t.dim)));
+    };
+    return h_flex().gap(4).flex_wrap().children(this.machineChoices().map(chip));
   }
 
   channelChoice(channel, title, detail, t) {
