@@ -7,6 +7,8 @@ import { startRun, followRunningRuns, purgeOldRuns } from "./runs.js";
 const TICK_MS = 15000;
 const FOLLOW_MS = 3000;
 const MAX_MISSED_COUNTED = 10000;
+// Checks are 15s apart: a longer silence means the minutes in between were never looked at.
+const MISSED_AFTER_MS = 75000;
 // The toast's click names the run it wants through this key: a mod command can't carry arguments.
 export const RUN_TO_SHOW_KEY = "benni.routines.show";
 
@@ -40,7 +42,6 @@ export class RoutineScheduler {
     this.ticking = false;
     this.following = false;
     if (checking()) return;
-    this.recordMissedRuns();
     this.tick(cx);
     cx.timer.every(TICK_MS, (cx) => this.tick(cx));
     cx.timer.every(FOLLOW_MS, (cx) => {
@@ -55,12 +56,12 @@ export class RoutineScheduler {
     });
   }
 
-  // Minutes due while Herdr was closed are skipped, not caught up: one "manquée" entry per routine.
-  recordMissedRuns() {
-    const { lastTick, routines } = readStore();
-    if (lastTick === null) return;
+  // Minutes due while nothing checked (Herdr closed, the Mac asleep) are skipped, not caught up:
+  // one "Manqué" entry per routine, with their count.
+  recordMissedRuns(lastTick, now) {
+    const { routines } = readStore();
     const from = new Date(startOfMinute(lastTick));
-    const to = new Date(startOfMinute(Date.now()));
+    const to = new Date(startOfMinute(now.getTime()));
     for (const routine of routines.filter((r) => r.enabled)) {
       let missed;
       try { missed = occurrencesBetween(parseCron(scheduleCron(routine.schedule)), from, to, MAX_MISSED_COUNTED); } catch { continue; }
@@ -82,6 +83,8 @@ export class RoutineScheduler {
     this.ticking = true;
     const now = new Date();
     const key = minuteKey(now);
+    const { lastTick } = readStore();
+    if (lastTick !== null && now.getTime() - lastTick > MISSED_AFTER_MS) this.recordMissedRuns(lastTick, now);
     const due = [];
     updateStore((store) => {
       for (const routine of store.routines) {

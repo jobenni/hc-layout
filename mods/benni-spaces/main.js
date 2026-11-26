@@ -1233,7 +1233,8 @@ export default class Spaces extends View {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
-    const list = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null }));
+    // The Routines space never nests under a repo, even when its first tab runs in one of its worktrees.
+    const list = sp.map((w, i) => ({ w, i, g: w.id === routinesSpaceId() ? null : this.git[where(w, ps)] ?? null }));
     const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
     const nested = (r) => r.g?.linked && mains.has(r.g.repo);
     const out = [];
@@ -1246,8 +1247,13 @@ export default class Spaces extends View {
       const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
       kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
     }
+    // Last of its machine's spaces: space.move can't take it past another machine's block.
     const routinesAt = out.findIndex((r) => r.w.id === routinesSpaceId());
-    if (routinesAt >= 0 && !out[routinesAt].tree) out.push(...out.splice(routinesAt, 1));
+    if (routinesAt >= 0) {
+      const [routines] = out.splice(routinesAt, 1);
+      const sameMachine = (r) => (r.w.machine ?? null) === (routines.w.machine ?? null);
+      out.splice(out.findLastIndex(sameMachine) + 1, 0, routines);
+    }
     this.foldRoutinesSpaceOnce();
     // Simulate the batch so later indexes include earlier moves. An attempted
     // write can lose a sync conflict: allow the echo to settle before retrying.

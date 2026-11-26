@@ -75,8 +75,20 @@ function claudeArguments(routine, run) {
   return args;
 }
 
-function routinesSpace(store) {
-  return spaces().find((s) => s.id === store.spaceId) ?? null;
+const SPACE_WAIT_MS = 10000;
+const SPACE_POLL_S = "0.5";
+let routinesSpaceRequestedAt = 0;
+
+function findRoutinesSpace() {
+  const { spaceId } = readStore();
+  return spaces().find((s) => s.id === spaceId)
+    ?? spaces().find((s) => s.named && s.name === ROUTINES_SPACE_NAME && !s.machine) ?? null;
+}
+
+// Two runs due in the same minute: the second waits for the space the first asked for.
+async function routinesSpaceOnceRequested() {
+  while (!findRoutinesSpace() && Date.now() - routinesSpaceRequestedAt < SPACE_WAIT_MS) await exec("sleep", [SPACE_POLL_S]);
+  return findRoutinesSpace();
 }
 
 /** Starts one run of a routine in its own tab of the Routines space, never taking focus. */
@@ -106,9 +118,13 @@ export async function startRun(routine, { manual = false, now = Date.now() } = {
       ? { argv: ["sh", RUNNER, logPathOf(runId), exitPathOf(runId), ...claudeArgs, "-p", "--output-format", "stream-json", "--verbose", prompt] }
       // tab.new appends `task` to argv: the wrapper hands it to claude as its first message.
       : { argv: ["sh", "-c", CLAUDE_VIA_LOGIN_SHELL, "sh", ...claudeArgs], task: prompt };
-    const space = routinesSpace(readStore());
-    if (space) run("tab.new", { space: space.id, name: tabName, folder: cwd, focus: false, ...launch });
-    else run("space.new", { name: ROUTINES_SPACE_NAME, folder: cwd, tab: tabName, focus: false, ...launch });
+    const space = await routinesSpaceOnceRequested();
+    if (space) {
+      run("tab.new", { space: space.id, name: tabName, folder: cwd, focus: false, ...launch });
+    } else {
+      routinesSpaceRequestedAt = Date.now();
+      run("space.new", { name: ROUTINES_SPACE_NAME, folder: cwd, tab: tabName, focus: false, ...launch });
+    }
   } catch (error) {
     updateRun(runId, (r) => { r.status = "failed"; r.endedAt = Date.now(); r.error = `Lancement impossible : ${error?.message ?? error}`; });
   }
