@@ -1075,11 +1075,11 @@ export default class Spaces extends View {
         .when(Boolean(since), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(elapsed(Date.now() - since))))
         .child(this.agentStatus(t, a.status)))
       .when(Boolean(reason) && reason !== a.sessionName, (el) => el.child(div().pl(detailIndent).truncate().text_size(11.5).text_color(tint).child(reason)))
-      .when(Boolean(issue), (el) => el.child(h_flex().id(`card-issue-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
-        .when(Boolean(ticket?.url), (row) => row.tooltip(`Ouvrir le ticket sur ${ticket.tracker ?? "GitHub"}`)
-          .on_click((_e, cx) => { cx.stop_propagation(); openUrl(ticket.url, cx); }))
+      .when(Boolean(issue), (el) => el.child(h_flex().pl(detailIndent).gap(5).items_center().text_size(11.5)
         .child(svg("mods/gh-issues/icons/issue.svg").size(12).flex_none().text_color(t.ansi2))
-        .child(div().flex_none().font_semibold().text_color(t.ansi2).child(`#${issue}`))
+        .child(div().id(`card-issue-${a.address}`).flex_none().font_semibold().text_color(t.ansi2).child(`#${issue}`)
+          .when(Boolean(ticket?.url), (link) => link.cursor_pointer().hover((s) => s.underline()).tooltip(`Ouvrir le ticket sur ${ticket.tracker ?? "GitHub"}`)
+            .on_click((_e, cx) => { cx.stop_propagation(); openUrl(ticket.url, cx); })))
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(ticket?.title ?? ""))))
       .when(Boolean(pr), (el) => el.child(this.pullRequestLine(a, pr, t, detailIndent)))
       .when(Boolean(nextStep), (el) => el.child(nextStep))
@@ -1092,15 +1092,15 @@ export default class Spaces extends View {
         .when(Boolean(g?.linked), (el) => el.child(div().flex_none().px(4).h(14).rounded(3).border_1().border_color(t.dim + "66").text_size(10).text_color(t.muted).flex().items_center().child("worktree"))));
   }
 
-  // "#12 ✗ ouverte · CI en échec": a click opens the PR.
+  // "#12 ✗ ouverte · CI en échec": a click on the number opens the PR.
   pullRequestLine(a, pr, t, detailIndent) {
     const look = pullRequestLook(pr, t);
     const checks = pr.state === "OPEN" ? CHECKS_LOOK[checksOutcome(pr)] : null;
-    return h_flex().id(`card-pr-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
-      .tooltip(`Ouvrir la PR sur ${pr.tracker ?? "GitHub"}`)
-      .on_click((_e, cx) => { cx.stop_propagation(); openUrl(pr.url, cx); })
+    return h_flex().pl(detailIndent).gap(5).items_center().text_size(11.5)
       .child(svg(look.icon).size(12).flex_none().text_color(look.color))
-      .child(div().flex_none().font_semibold().text_color(look.color).child(`#${pr.number}`))
+      .child(div().id(`card-pr-${a.address}`).flex_none().font_semibold().text_color(look.color).child(`#${pr.number}`)
+        .cursor_pointer().hover((s) => s.underline()).tooltip(`Ouvrir la PR sur ${pr.tracker ?? "GitHub"}`)
+        .on_click((_e, cx) => { cx.stop_propagation(); openUrl(pr.url, cx); }))
       .when(Boolean(checks), (el) => el.child(checks === CHECKS_LOOK.pending
         ? div().flex_none().text_color(t.working).frames(["◐", "◓", "◑", "◒"], 160)
         : div().flex_none().text_color(t[checks.tone]).child(checks.glyph)))
