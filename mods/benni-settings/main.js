@@ -1,11 +1,12 @@
 // The layout's own settings, opened as a dialog from the tab bar's gear.
 // Sections on the left: Workspaces (groups of spaces above the Spaces list) and Mise à jour.
-// Workspaces live in shared("benni.workspaces") = { enabled, list: [{ id, name }], of: { spaceId: workspaceId } },
-// which benni-spaces reads; a space with no workspace (or a deleted one's) is in the default one.
+// Workspaces live in each machine's benni/workspaces.json (see workspaces-store.js), which benni-spaces
+// draws from its cache; a space with no workspace (or a deleted one's) is in the default one.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, props, closeOverlay, theme, shared, setShared, exec, readTextFile, appHome, checking, notify } from "herdr";
+import { DEFAULT_WORKSPACE, readWorkspaces, workspaceOfSpace, changeWorkspaces, syncWorkspaces } from "./workspaces-store.js";
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
@@ -31,8 +32,6 @@ async function readLatestCommit(branch) {
   return commit;
 }
 
-const WORKSPACES_KEY = "benni.workspaces";
-const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
 const SECTIONS = [
   { id: "workspaces", label: "Workspaces", icon: "mods/workspace-chrome/layers.svg" },
   { id: "update", label: "Mise à jour", icon: "mods/git-graph/icons/refresh.svg" },
@@ -65,23 +64,8 @@ function parseInstallLog(text) {
 
 const shortCommit = (commit) => commit ? commit.slice(0, 7) : "inconnue";
 
-function readWorkspaces() {
-  const stored = shared(WORKSPACES_KEY) ?? {};
-  const list = Array.isArray(stored.list) ? stored.list.filter((w) => w?.id && typeof w.name === "string") : [];
-  if (!list.some((w) => w.id === DEFAULT_WORKSPACE.id)) list.unshift({ ...DEFAULT_WORKSPACE });
-  const of = stored.of && typeof stored.of === "object" && !Array.isArray(stored.of) ? stored.of : {};
-  return { enabled: stored.enabled === true, list, of };
-}
-
-const writeWorkspaces = (store) => setShared(WORKSPACES_KEY, store);
-
 function newWorkspaceId(list) {
   for (let n = 1; ; n++) if (!list.some((w) => w.id === `ws${n}`)) return `ws${n}`;
-}
-
-function workspaceOfSpace(store, spaceId) {
-  const id = store.of[spaceId];
-  return store.list.some((w) => w.id === id) ? id : DEFAULT_WORKSPACE.id;
 }
 
 export default class Settings extends View {
@@ -96,8 +80,11 @@ export default class Settings extends View {
     this.renameInput = InputState.new({});
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
     this.update = { phase: "checking", branch: chosenBranch(), installed: null, latest: null, error: "" };
+    this.machine = null; // whose workspaces the section edits: null is this computer
+    this.saveError = "";
     this.handle.focus();
     if (checking()) return;
+    this.reloadWorkspaces(cx);
     this.checkForUpdate(cx);
     this.resumeRunningInstall(cx);
   }
@@ -175,14 +162,28 @@ export default class Settings extends View {
     cx.notify();
   }
 
+  reloadWorkspaces(cx) {
+    const machine = this.machine;
+    cx.spawn(async (cx) => { await syncWorkspaces(machine); cx.notify(); });
+  }
+
+  // Every edit reads the machine's file again and writes it only if nobody changed it meanwhile.
+  editWorkspaces(change, cx) {
+    const machine = this.machine;
+    this.saveError = "";
+    cx.spawn(async (cx) => {
+      try { await changeWorkspaces(machine, change); }
+      catch (error) { this.saveError = `Enregistrement impossible : ${error?.message ?? error}`; }
+      cx.notify();
+    });
+    cx.notify();
+  }
+
   addWorkspace(cx) {
     const name = this.addInput.value().trim();
     if (!name) return;
-    const store = readWorkspaces();
-    store.list.push({ id: newWorkspaceId(store.list), name });
-    writeWorkspaces(store);
+    this.editWorkspaces((store) => { store.list.push({ id: newWorkspaceId(store.list), name }); }, cx);
     this.addInput.set_value("");
-    cx.notify();
   }
 
   startRename(w, cx) {
@@ -196,40 +197,36 @@ export default class Settings extends View {
 
   finishRename(cx) {
     const name = this.renameInput.value().trim();
-    const store = readWorkspaces();
-    const w = store.list.find((k) => k.id === this.renaming);
-    if (w && name && name !== w.name) {
-      w.name = name;
-      writeWorkspaces(store);
+    const id = this.renaming;
+    const current = readWorkspaces(this.machine).list.find((k) => k.id === id);
+    if (current && name && name !== current.name) {
+      this.editWorkspaces((store) => { const w = store.list.find((k) => k.id === id); if (w) w.name = name; }, cx);
     }
     this.renaming = null;
     this.handle.focus();
     cx.notify();
   }
 
-  // Its spaces go back to the default workspace (readWorkspaces recreates it if it's gone).
+  // Its spaces go back to the default workspace (normalizeWorkspaces recreates it if it's gone).
   deleteWorkspace(id, cx) {
-    const store = readWorkspaces();
-    store.list = store.list.filter((w) => w.id !== id);
-    for (const [space, ws] of Object.entries(store.of)) if (ws === id) delete store.of[space];
-    writeWorkspaces(store);
+    this.editWorkspaces((store) => {
+      store.list = store.list.filter((w) => w.id !== id);
+      for (const [space, ws] of Object.entries(store.of)) if (ws === id) delete store.of[space];
+    }, cx);
     this.deleting = null;
-    cx.notify();
   }
 
   moveWorkspace(id, by, cx) {
-    const store = readWorkspaces();
-    const from = store.list.findIndex((w) => w.id === id);
-    const to = from + by;
-    if (from < 0 || to < 0 || to >= store.list.length) return;
-    store.list.splice(to, 0, store.list.splice(from, 1)[0]);
-    writeWorkspaces(store);
-    cx.notify();
+    this.editWorkspaces((store) => {
+      const from = store.list.findIndex((w) => w.id === id);
+      const to = from + by;
+      if (from < 0 || to < 0 || to >= store.list.length) return;
+      store.list.splice(to, 0, store.list.splice(from, 1)[0]);
+    }, cx);
   }
 
   setEnabled(enabled, cx) {
-    writeWorkspaces({ ...readWorkspaces(), enabled });
-    cx.notify();
+    this.editWorkspaces((store) => { store.enabled = enabled; }, cx);
   }
 
   key(e, cx) {
@@ -293,9 +290,9 @@ export default class Settings extends View {
   }
 
   workspacesSection(t) {
-    const store = readWorkspaces();
+    const store = readWorkspaces(this.machine);
     const counts = new Map();
-    for (const s of spaces()) {
+    for (const s of spaces().filter((k) => (k.machine ?? null) === this.machine)) {
       const ws = workspaceOfSpace(store, s.id);
       counts.set(ws, (counts.get(ws) ?? 0) + 1);
     }
@@ -309,7 +306,8 @@ export default class Settings extends View {
         .children(store.list.map((w, i) => this.workspaceRow(w, i, store, counts, t))))
       .child(h_flex().gap(8).items_center().when(!store.enabled, (el) => el.opacity(0.5))
         .child(Input.new(this.addInput).flex_1().h(30).px(10).rounded(7).border_1().border_color(t.input).bg(t.background).text_size(12.5).text_color(t.foreground))
-        .child(this.textButton("ws-add", "Ajouter", true, t, (_e, cx) => this.addWorkspace(cx))));
+        .child(this.textButton("ws-add", "Ajouter", true, t, (_e, cx) => this.addWorkspace(cx))))
+      .when(Boolean(this.saveError), (el) => el.child(div().text_size(12).text_color(t.blocked).child(this.saveError)));
   }
 
   channelChoice(channel, title, detail, t) {

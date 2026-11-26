@@ -6,6 +6,8 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
 import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, checking, updates } from "herdr";
+import { machineKey } from "./machine-files.js";
+import { DEFAULT_WORKSPACE, readWorkspaces, workspaceOfSpace, changeWorkspaces, syncWorkspaces } from "./workspaces-store.js";
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
 // install.sh records the commit it installed in <appHome>/hc-layout.json; shared("benni.update") = { installed, latest }.
@@ -262,29 +264,30 @@ function agentIcon(program, size, color, bot = false) {
   return program.tint ? svg(program.icon).size(size).flex_none().text_color(color) : image(program.icon).w(size).h(size).flex_none();
 }
 
-// Workspaces group the spaces (work, personal…). benni-settings owns the list and the switch;
-// this list reads them and records where a dropped space goes. Mods can't share modules, so
-// this reader repeats benni-settings' own: same key, same rules.
-const WORKSPACES_KEY = "benni.workspaces";
-const DEFAULT_WORKSPACE = { id: "default", name: "Default" };
+// Workspaces group each machine's spaces (work, personal…), kept in that machine's own benni/workspaces.json
+// (see workspaces-store.js). benni-settings edits the list and the switch; this list reads them, records
+// where a dropped space goes, and reads every machine's file again now and then (another client may edit it).
 // A space made from a workspace's "+" joins it if it shows up within this long.
 const NEW_SPACE_WAIT = 10000;
+const WORKSPACES_RELOAD = 20000;
 
-function readWorkspaces() {
-  const stored = shared(WORKSPACES_KEY) ?? {};
-  const list = Array.isArray(stored.list) ? stored.list.filter((w) => w?.id && typeof w.name === "string") : [];
-  if (!list.some((w) => w.id === DEFAULT_WORKSPACE.id)) list.unshift({ ...DEFAULT_WORKSPACE });
-  const of = stored.of && typeof stored.of === "object" && !Array.isArray(stored.of) ? stored.of : {};
-  return { enabled: stored.enabled === true, list, of };
+const workspaceDropKey = (machine, workspaceId) => `ws:${machineKey(machine)}:${workspaceId}`;
+// The settings open on the workspaces of the machine whose tab was right-clicked (benni-settings reads this key).
+const SETTINGS_MACHINE_KEY = "benni.settings.machine";
+const openSettings = (machine) => {
+  setShared(SETTINGS_MACHINE_KEY, machineKey(machine));
+  openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 });
+};
+
+// localStorage workspaces.selected: { machineKey: workspaceId }; a plain id is this computer's (before machines had their own).
+function readSelectedWorkspaces() {
+  const stored = localStorage.getItem("workspaces.selected");
+  try {
+    const parsed = JSON.parse(stored ?? "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch {}
+  return stored ? { "": stored } : {};
 }
-
-function workspaceOfSpace(store, spaceId) {
-  const id = store.of[spaceId];
-  return store.list.some((w) => w.id === id) ? id : DEFAULT_WORKSPACE.id;
-}
-
-const workspaceDropKey = (workspaceId) => `ws:${workspaceId}`;
-const openSettings = () => openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 });
 
 export default class Spaces extends View {
   init(_props, cx) {
@@ -318,14 +321,22 @@ export default class Spaces extends View {
     } catch { this.reconnecting = {}; }
     try { this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]")); } catch { this.folded = new Set(); }
     try { this.foldedSpaces = new Set(JSON.parse(localStorage.getItem("spaces.folded") ?? "[]")); } catch { this.foldedSpaces = new Set(); }
-    this.selectedWorkspace = localStorage.getItem("workspaces.selected") ?? DEFAULT_WORKSPACE.id; // the tab whose spaces the list shows
+    this.selectedWorkspaces = readSelectedWorkspaces(); // machineKey -> the tab whose spaces the list shows
     this.followedActiveSpace = null; // the active space the selected tab last followed
     this.newSpaceWorkspace = null; // { id, at, known }: the workspace a space being made from the sidebar joins
     this.lastRows = []; // the rows last drawn, with their workspace: a dropped space takes its worktrees along
     try { this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}"); } catch { this.changed = {}; }
     if (!this.changed || typeof this.changed !== "object" || Array.isArray(this.changed)) this.changed = {};
+    this.syncingWorkspaces = new Set(); // machineKeys whose file is being read
+    this.workspacesReady = {}; // machineKey -> its layout was ready at the last reload
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
+    if (!checking()) {
+      this.reloadWorkspaces(cx);
+      cx.timer.every(WORKSPACES_RELOAD, (cx) => this.reloadWorkspaces(cx));
+      // A machine that comes back is read at once, not at the next reload.
+      cx.timer.every(1000, (cx) => this.reloadReturningMachines(cx));
+    }
     cx.timer.every(30000, cx => cx.notify());
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
@@ -358,7 +369,7 @@ export default class Spaces extends View {
     const now = Date.now();
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
-    this.placeNewSpace(now, sp);
+    this.placeNewSpace(now, sp, cx);
     const ps = panes();
     const due = this.due(now, sp, ps);
     if (due.size) this.refreshGit(due, cx);
@@ -461,105 +472,152 @@ export default class Spaces extends View {
     localStorage.setItem("spaces.folded", JSON.stringify([...this.foldedSpaces]));
   }
 
-  // A space and the worktrees drawn under it move to `workspaceId` together.
-  moveToWorkspace(spaceId, workspaceId) {
-    const store = readWorkspaces();
+  // Every machine known here: this computer, those in `hc machine ls`, and those with spaces.
+  knownMachines() {
+    const names = new Set([...this.machines.map((m) => m.name), ...machines().map((m) => m.name).filter(Boolean)]);
+    return [null, ...[...names].sort()];
+  }
+
+  reloadWorkspaces(cx) {
+    for (const machine of this.knownMachines()) this.syncWorkspacesOf(machine, cx);
+  }
+
+  reloadReturningMachines(cx) {
+    for (const m of machines()) {
+      const ready = m.layout === "ready";
+      if (ready && this.workspacesReady[machineKey(m.name)] === false) this.syncWorkspacesOf(m.name, cx);
+      this.workspacesReady[machineKey(m.name)] = ready;
+    }
+  }
+
+  syncWorkspacesOf(machine, cx) {
+    const key = machineKey(machine);
+    if (this.syncingWorkspaces.has(key)) return;
+    this.syncingWorkspaces.add(key);
+    cx.spawn(async () => {
+      try { await syncWorkspaces(machine); } finally { this.syncingWorkspaces.delete(key); }
+    });
+  }
+
+  // A space and the worktrees drawn under it move to `workspaceId` of their machine together.
+  moveToWorkspace(spaceId, workspaceId, cx) {
+    const machine = spaces().find((s) => s.id === spaceId)?.machine ?? null;
     const at = this.lastRows.findIndex((r) => r.w.id === spaceId);
     const ids = [spaceId];
     if (at >= 0 && !this.lastRows[at].tree) for (const r of this.lastRows.slice(at + 1)) {
       if (!r.tree) break;
       ids.push(r.w.id);
     }
-    if (ids.every((id) => workspaceOfSpace(store, id) === workspaceId)) return;
-    for (const id of ids) {
-      if (workspaceId === DEFAULT_WORKSPACE.id) delete store.of[id];
-      else store.of[id] = workspaceId;
-    }
-    setShared(WORKSPACES_KEY, store);
+    if (ids.every((id) => workspaceOfSpace(readWorkspaces(machine), id) === workspaceId)) return;
+    cx.spawn(async () => {
+      try {
+        await changeWorkspaces(machine, (store) => {
+          for (const id of ids) {
+            if (workspaceId === DEFAULT_WORKSPACE.id) delete store.of[id];
+            else store.of[id] = workspaceId;
+          }
+        });
+      } catch (error) {
+        notify({ title: "Workspace non enregistré", body: `${machine ?? "Cet ordinateur"} : ${error?.message ?? error}`, level: "error" });
+      }
+    });
   }
 
-  newSpaceIn(workspaceId) {
-    this.newSpaceWorkspace = { id: workspaceId, at: Date.now(), known: new Set(spaces().map((s) => s.id)) };
-    run("space.new");
+  newSpaceIn(machine, workspaceId) {
+    this.newSpaceWorkspace = { machine, id: workspaceId, at: Date.now(), known: new Set(spaces().map((s) => s.id)) };
+    run("space.new", { machine: machine ?? "" });
   }
 
-  placeNewSpace(now, sp) {
+  placeNewSpace(now, sp, cx) {
     const pending = this.newSpaceWorkspace;
     if (!pending) return;
     if (now - pending.at > NEW_SPACE_WAIT) { this.newSpaceWorkspace = null; return; }
-    const made = sp.find((s) => !pending.known.has(s.id));
+    const made = sp.find((s) => !pending.known.has(s.id) && (s.machine ?? null) === pending.machine);
     if (!made) return;
     this.newSpaceWorkspace = null;
-    this.moveToWorkspace(made.id, pending.id);
+    this.moveToWorkspace(made.id, pending.id, cx);
   }
 
-  selectWorkspace(id, cx) {
-    this.selectedWorkspace = id;
-    localStorage.setItem("workspaces.selected", id);
+  // The new space joins the selected tab of its machine when that machine uses workspaces.
+  newSpaceOn(machine) {
+    if (readWorkspaces(machine).enabled) this.newSpaceIn(machine, this.shownWorkspace(machine));
+    else run("space.new", { machine: machine ?? "" });
+  }
+
+  selectWorkspace(machine, id, cx) {
+    this.selectedWorkspaces[machineKey(machine)] = id;
+    localStorage.setItem("workspaces.selected", JSON.stringify(this.selectedWorkspaces));
     cx?.notify();
   }
 
-  // The selected tab follows the active space when another one becomes active, from anywhere.
-  shownWorkspace(store, rows) {
+  // When another space becomes active, from anywhere, its machine's selected tab follows it.
+  followActiveSpace(rows) {
     const active = rows.find((r) => r.w.active);
-    if (active && active.w.id !== this.followedActiveSpace) {
-      this.followedActiveSpace = active.w.id;
-      if (active.ws !== this.selectedWorkspace) this.selectWorkspace(active.ws);
-    }
-    if (!store.list.some((w) => w.id === this.selectedWorkspace)) this.selectedWorkspace = DEFAULT_WORKSPACE.id;
-    return this.selectedWorkspace;
+    if (!active || active.w.id === this.followedActiveSpace) return;
+    this.followedActiveSpace = active.w.id;
+    const machine = active.w.machine ?? null;
+    if (active.ws !== this.selectedWorkspaces[machineKey(machine)]) this.selectWorkspace(machine, active.ws);
   }
 
-  // A workspace tab or its empty slot takes a dragged space.
-  workspaceDropTarget(el, ws) {
-    const key = workspaceDropKey(ws.id);
+  shownWorkspace(machine) {
+    const selected = this.selectedWorkspaces[machineKey(machine)];
+    return readWorkspaces(machine).list.some((w) => w.id === selected) ? selected : DEFAULT_WORKSPACE.id;
+  }
+
+  // A workspace tab or its empty slot takes a dragged space of the same machine.
+  workspaceDropTarget(el, machine, ws) {
+    const key = workspaceDropKey(machine, ws.id);
+    const takes = () => (spaces().find((s) => s.id === this.pressed)?.machine ?? null) === machine;
     return el
       .on_mouse_move((_e, cx) => {
-        if (this.pressed !== null && this.over !== key) { this.over = key; cx.notify(); }
+        const over = takes() ? key : null;
+        if (this.pressed !== null && this.over !== over) { this.over = over; cx.notify(); }
       })
       .on_mouse_up("left", (_e, cx) => {
         const from = this.pressed;
+        const dropped = this.over === key;
         this.pressed = null;
         this.over = null;
-        if (from !== null) this.moveToWorkspace(from, ws.id);
+        if (from !== null && dropped) this.moveToWorkspace(from, ws.id, cx);
         cx.notify();
       });
   }
 
-  workspaceTab(ws, rows, selected, t, collapsed) {
-    const dropping = this.pressed !== null && this.over === workspaceDropKey(ws.id);
+  workspaceTab(machine, ws, rows, selected, t, collapsed) {
+    const dropping = this.pressed !== null && this.over === workspaceDropKey(machine, ws.id);
     const holdsActiveSpace = rows.some((r) => r.w.active);
-    const tab = h_flex().id(`workspace-${ws.id}`).flex_none().items_center().rounded(6).cursor_pointer()
+    const tab = h_flex().id(`workspace-${machineKey(machine)}-${ws.id}`).flex_none().items_center().rounded(6).cursor_pointer()
       .when(dropping, (el) => el.bg(t.accent + "26"))
       .when(!dropping && selected, (el) => el.bg(t.selected))
       .when(!dropping && !selected, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click((_e, cx) => this.selectWorkspace(ws.id, cx))
-      .on_mouse_down("right", openSettings)
+      .on_click((_e, cx) => this.selectWorkspace(machine, ws.id, cx))
+      .on_mouse_down("right", () => openSettings(machine))
       .tooltip(`${ws.name} · ${rows.length} space${rows.length > 1 ? "s" : ""}`);
     if (collapsed) {
-      return railCell(this.workspaceDropTarget(tab, ws).w(RAIL_CELL).h(22).justify_center()
+      return railCell(this.workspaceDropTarget(tab, machine, ws).w(RAIL_CELL).h(22).justify_center()
         .text_size(10).font_bold().text_color(selected ? t.foreground : t.dim).child([...ws.name].slice(0, 2).join("").toUpperCase()));
     }
-    return this.workspaceDropTarget(tab, ws).h(24).px(8).gap(5)
+    return this.workspaceDropTarget(tab, machine, ws).h(24).px(8).gap(5)
       .text_size(11.5).font_semibold().text_color(selected ? t.foreground : t.muted)
       .child(ws.name)
       .child(div().text_size(10.5).text_color(t.dim).child(String(rows.length)))
       .when(holdsActiveSpace && !selected, (el) => el.child(div().size(5).rounded_full().flex_none().bg(t.accent)));
   }
 
-  workspaceTabs(t, collapsed) {
-    const store = readWorkspaces();
-    const shown = this.shownWorkspace(store, this.lastRows);
-    const tabs = store.list.map((ws) => this.workspaceTab(ws, this.lastRows.filter((r) => r.ws === ws.id), ws.id === shown, t, collapsed));
+  // One machine's workspace tabs; `rows` are its rows, with their workspace.
+  workspaceTabs(machine, rows, t, collapsed) {
+    const store = readWorkspaces(machine);
+    const shown = this.shownWorkspace(machine);
+    const tabs = store.list.map((ws) => this.workspaceTab(machine, ws, rows.filter((r) => r.ws === ws.id), ws.id === shown, t, collapsed));
     if (collapsed) return v_flex().flex_none().gap(2).pb(6).children(tabs);
-    return h_flex().id("workspace-tabs").flex_none().h(32).px(8).gap(2).items_center().overflow_x_scroll().children(tabs);
+    return h_flex().id(`workspace-tabs-${machineKey(machine)}`).flex_none().h(32).px(8).gap(2).items_center().overflow_x_scroll().children(tabs);
   }
 
-  emptyWorkspace(ws, t, collapsed) {
+  emptyWorkspace(machine, ws, t, collapsed) {
     if (collapsed) return div().h(2).flex_none();
-    const dropping = this.pressed !== null && this.over === workspaceDropKey(ws.id);
-    return this.workspaceDropTarget(h_flex().id(`workspace-empty-${ws.id}`).h(28).mx(4).flex_none().items_center().justify_center()
-      .rounded(7).border_1().border_color(dropping ? t.accent : t.border).text_size(11.5).text_color(t.dim), ws)
+    const dropping = this.pressed !== null && this.over === workspaceDropKey(machine, ws.id);
+    return this.workspaceDropTarget(h_flex().id(`workspace-empty-${machineKey(machine)}-${ws.id}`).h(28).mx(4).flex_none().items_center().justify_center()
+      .rounded(7).border_1().border_color(dropping ? t.accent : t.border).text_size(11.5).text_color(t.dim), machine, ws)
       .child(this.pressed !== null ? "Déposer ici" : "Glisse un space ici");
   }
 
@@ -1277,23 +1335,33 @@ export default class Spaces extends View {
     return out.filter(r => this.shown.has(r.w.id));
   }
 
-  // With workspaces on, the list shows the selected tab's spaces only.
+  // Machines other than this computer that the list shows: with spaces, in `hc machine ls`, or being reconnected.
+  remoteMachines(rows) {
+    return [...new Set([...rows.map((r) => r.w.machine).filter(Boolean), ...this.machines.map((m) => m.name), ...Object.keys(this.reconnecting)])].sort();
+  }
+
+  // Machine, then its workspace tabs (in their order, when it uses them), then the list's order.
+  // A machine using workspaces shows the selected tab's spaces only.
   grouped(t, collapsed) {
     const rows = this.ordered();
-    const store = readWorkspaces();
-    const workspaces = store.enabled ? store.list : null;
     // A worktree drawn under its main checkout stays in that checkout's workspace.
     let main = null;
     for (const r of rows) {
       if (!r.tree) main = r;
-      r.ws = r.tree && main ? main.ws : workspaceOfSpace(store, r.w.id);
+      r.ws = r.tree && main ? main.ws : workspaceOfSpace(readWorkspaces(r.w.machine), r.w.id);
     }
     this.lastRows = rows;
-    const rowsOf = (ws) => rows.filter((r) => r.ws === ws.id);
-    const shownRows = workspaces ? workspaces.flatMap(rowsOf) : rows;
+    this.followActiveSpace(rows);
+    const machineNames = [null, ...this.remoteMachines(rows)];
+    const rowsOfMachine = (m) => rows.filter((r) => (r.w.machine ?? null) === m);
+    const inTabOrder = (m) => {
+      const mine = rowsOfMachine(m);
+      const store = readWorkspaces(m);
+      return store.enabled ? store.list.flatMap((ws) => mine.filter((r) => r.ws === ws.id)) : mine;
+    };
     const bySpace = collapsed ? new Map() : this.agentsBySpace();
     const terminalsBySpace = collapsed ? new Map() : this.terminalsBySpace();
-    setAgentOrder(shownRows.flatMap((r) => (bySpace.get(r.w.id) ?? []).map((a) => a.address)));
+    setAgentOrder(machineNames.flatMap(inTabOrder).flatMap((r) => (bySpace.get(r.w.id) ?? []).map((a) => a.address)));
     const sessionsOf = (r) => bySpace.get(r.w.id) ?? [];
     const drawSpace = (r) => (collapsed ? this.compact(r, t) : this.row(r, t, sessionsOf(r)));
     const shownAgents = (r) => (this.foldedSpaces.has(r.w.id) ? [] : sessionsOf(r));
@@ -1305,35 +1373,38 @@ export default class Spaces extends View {
     ]);
     const rowsUnder = (r) => shownAgents(r).length + shownTerminals(r).length;
     const childIndexOf = (list, found) => found < 0 ? -1 : list.slice(0, found).reduce((n, r) => n + 1 + rowsUnder(r), 0);
-    const draw = { drawAll, childIndexOf };
-    if (!workspaces) return this.machineItems(rows, t, collapsed, draw, true);
-    const shown = workspaces.find((ws) => ws.id === this.shownWorkspace(store, rows));
-    // Machines without spaces yet are offered in the default workspace only.
-    const section = this.machineItems(rowsOf(shown), t, collapsed, draw, shown.id === DEFAULT_WORKSPACE.id);
-    return section.length ? section : [this.emptyWorkspace(shown, t, collapsed)];
+    // One machine's spaces: all of them, or its selected tab's (else that tab's empty slot).
+    const section = (m) => {
+      const mine = rowsOfMachine(m);
+      const store = readWorkspaces(m);
+      if (!store.enabled || !mine.length) return { shown: mine, items: drawAll(mine) };
+      const ws = store.list.find((w) => w.id === this.shownWorkspace(m));
+      const shown = mine.filter((r) => r.ws === ws.id);
+      return { shown, items: shown.length ? drawAll(shown) : [this.emptyWorkspace(m, ws, t, collapsed)] };
+    };
+    return this.machineItems(machineNames, rowsOfMachine, section, t, collapsed, childIndexOf);
   }
 
   // Sets this.activeAt to where the active space's row lands among the children this returns: the list
-  // scrolls by its direct children, and machine headers, login notes and loading rows count too.
-  machineItems(rows, t, collapsed, { drawAll, childIndexOf }, withIdleMachines) {
+  // scrolls by its direct children, and machine headers, login notes, workspace tabs and loading rows count too.
+  // With only this computer known there is no header, and render() draws its tabs above the list.
+  machineItems(machineNames, rowsOfMachine, section, t, collapsed, childIndexOf) {
     this.activeAt = -1;
     let before = 0;
-    const idleMachines = withIdleMachines ? [...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)] : [];
-    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...idleMachines])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
       return layout === "loading" || (!layout && this.machines.some(k => k.name === m && k.state === "connected"))
         || spaces().some(s => (s.machine ?? null) === m && !this.shown.has(s.id));
     };
     const loadingRow = m => h_flex().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(collapsed ? 0 : 8).items_center().when(collapsed, el => el.justify_center()).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
-    if (!remote.length) {
-      if (loading(null) && !rows.length) return [loadingRow(null)];
-      this.activeAt = childIndexOf(rows, rows.findIndex(r => r.w.active));
-      return drawAll(rows);
+    if (machineNames.length === 1) {
+      const { shown, items } = section(null);
+      if (loading(null) && !rowsOfMachine(null).length) return [loadingRow(null)];
+      this.activeAt = childIndexOf(shown, shown.findIndex(r => r.w.active));
+      return items;
     }
-    const machineNames = [null, ...remote];
     return machineNames.flatMap((m) => {
-      const mine = rows.filter((r) => (r.w.machine ?? null) === m);
+      const mine = rowsOfMachine(m);
       const repair = this.reconnecting[m];
       const machine = this.machines.find(k => k.name === m) ?? repair?.machine;
       const connected = !m || machine?.state === "connected";
@@ -1366,12 +1437,12 @@ export default class Spaces extends View {
               .on_click((_e, cx) => { cx.stop_propagation(); this.reconnect(machine, cx); })
               .child(repair?.busy ? "Connecting…" : "Connect"))))
           .when(connected, el => el.child(div().id(`machine-add-${m ?? "local"}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
-            .on_click((_e, cx) => { cx.stop_propagation(); run("space.new", { machine: m ?? "" }); }).child("+")))
+            .on_click((_e, cx) => { cx.stop_propagation(); this.newSpaceOn(m); }).child("+")))
           .child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim))
           .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11).flex_none()));
       const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(collapsed ? 0 : 8).gap(7).items_center().rounded(7)
         .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
-        .on_click(() => run("space.new", { machine: m ?? "" }))
+        .on_click(() => this.newSpaceOn(m))
         .when(collapsed, el => el.w(RAIL_CELL).rounded(6).justify_center().tooltip(`New space on ${m ?? "this computer"}`)
           .child(h_flex().size(18).rounded(5).border_1().border_color(t.dim).items_center().justify_center()
             .child(svg("mods/workspace-chrome/plus.svg").size(10))))
@@ -1386,9 +1457,12 @@ export default class Spaces extends View {
             .text_size(11).text_color(t.foreground).bg(t.raised).cursor_pointer().hover(s => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(login); this.copiedLogin = login; cx.notify(); })
             .child(this.copiedLogin === login ? "Copied" : "Copy")))] : [];
-      const items = [cell(head), ...guidance, ...(folded ? [] : mine.length ? drawAll(mine) : [loading(m) ? loadingRow(m) : cell(empty)])];
-      const first = folded ? -1 : childIndexOf(mine, mine.findIndex(r => r.w.active));
-      if (first >= 0) this.activeAt = before + 1 + guidance.length + first;
+      const tabs = !folded && readWorkspaces(m).enabled ? [this.workspaceTabs(m, mine, t, collapsed)] : [];
+      const { shown, items: spaceItems } = section(m);
+      const body = folded ? [] : mine.length ? spaceItems : [loading(m) ? loadingRow(m) : cell(empty)];
+      const items = [cell(head), ...guidance, ...tabs, ...body];
+      const first = folded ? -1 : childIndexOf(shown, shown.findIndex(r => r.w.active));
+      if (first >= 0) this.activeAt = before + 1 + guidance.length + tabs.length + first;
       before += items.length;
       return items;
     });
@@ -1485,10 +1559,8 @@ export default class Spaces extends View {
       })
       .on_mouse_move((_e, cx) => {
         const source = spaces().find(s => s.id === this.pressed);
-        const sourceWorkspace = this.lastRows.find(r => r.w.id === this.pressed)?.ws;
-        // space.move stays within a machine; changing workspace works across machines.
-        const takes = source && (sourceWorkspace !== ws || (source.machine ?? null) === (w.machine ?? null));
-        const over = takes ? w.id : null;
+        // space.move stays within a machine, and so do workspaces.
+        const over = source && (source.machine ?? null) === (w.machine ?? null) ? w.id : null;
         if (this.pressed !== null && this.over !== over) {
           this.over = over;
           cx.notify();
@@ -1500,7 +1572,7 @@ export default class Spaces extends View {
         this.pressed = null;
         this.over = null;
         if (from !== null && over === w.id && from !== w.id) {
-          if (readWorkspaces().enabled) this.moveToWorkspace(from, ws);
+          if (readWorkspaces(w.machine ?? null).enabled) this.moveToWorkspace(from, ws, cx);
           const source = spaces().find(s => s.id === from);
           const index = spaces().findIndex(s => s.id === w.id);
           if (index !== -1 && (source?.machine ?? null) === (w.machine ?? null)) run("space.move", { id: from, index: index + 1 });
@@ -1568,6 +1640,7 @@ export default class Spaces extends View {
     }
     if (changed) setShared("space.colors", kept);
     const list = this.grouped(t, collapsed);
+    const onlyThisComputer = this.remoteMachines(this.lastRows).length === 0;
     // Bring the active space into view when it, or its place in the list, changes; a row already in view stays put.
     const active = sp.find(p => p.active)?.id;
     if (active !== this.revealed || this.activeAt !== this.revealedAt) {
@@ -1593,11 +1666,9 @@ export default class Spaces extends View {
           .on_click((_e, cx) => this.toggleAllSpacesFold(cx))
           .child(svg(`mods/benni-spaces/chevrons-${this.allSpacesFolded() ? "up-down" : "down-up"}.svg`).size(14))))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
-          .on_click(() => {
-            if (readWorkspaces().enabled) this.newSpaceIn(this.selectedWorkspace);
-            else run("space.new");
-          }).child(svg("mods/workspace-chrome/plus.svg").size(14))))
-      .when(readWorkspaces().enabled, (el) => el.child(this.workspaceTabs(t, collapsed)))
+          .on_click(() => this.newSpaceOn(sp.find((p) => p.active)?.machine ?? null)).child(svg("mods/workspace-chrome/plus.svg").size(14))))
+      // With only this computer known, its tabs stay above the list; otherwise each machine's sit under its header.
+      .when(onlyThisComputer && readWorkspaces(null).enabled, (el) => el.child(this.workspaceTabs(null, this.lastRows, t, collapsed)))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
