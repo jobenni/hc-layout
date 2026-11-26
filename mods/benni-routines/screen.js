@@ -1,6 +1,6 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Select, Popup } from "gpui-base";
-import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, machines } from "herdr";
+import { props, theme, closeOverlay, pickFolder, exec, checking, nextCommand, machines, focused } from "herdr";
 import { readStore, readAllStores, changeRoutines, changeRuns, syncStore, storeState, clockOf, blankRoutine, MODELS, EFFORTS, DEFAULT_KEPT_RUNS } from "./store.js";
 import { PRESETS, WEEKDAYS, INTERVAL_MAX_MINUTES, describeSchedule, scheduleError, normalizeSchedule, timesOf, nextRunOf, formatWhen, formatDuration, startOfMinute } from "./schedule.js";
 import { startRun, purgeOldRuns, focusRunTab, resumeInTab, closeRunTab, cleanWorktree, removeRunFiles } from "./runs.js";
@@ -23,10 +23,15 @@ const EFFORT_GROOVE = 6;
 const EFFORT_DOT = 4;
 const LIST_WIDTH = 340;
 const LAYOUT_CHECK_MS = 1000;
+const FOCUS_CHECK_MS = 150;
 const STATUS_LABEL = { running: "En cours", done: "Terminé", failed: "Échec", missed: "Manqué" };
 
 const effortColor = (t, effort) => ({ low: t.ansi4, medium: t.ansi6, high: t.ansi2, xhigh: t.ansi3, max: t.ansi1 }[effort] ?? t.dim);
 const statusColor = (t, status) => ({ running: t.working, done: t.ansi2, failed: t.ansi1, missed: t.dim }[status] ?? t.dim);
+const focusKey = () => {
+  const now = focused();
+  return now ? `${now.space}/${now.tab}/${now.pane}` : null;
+};
 const firstLine = (text) => (text ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
 
 /** The Routines screen: over the whole work column, routines on the left, their runs on the right. */
@@ -61,6 +66,8 @@ export class RoutinesScreen {
     this.modelMenu = { open: false, highlighted: 0, trigger: cx.focus_handle(), list: cx.focus_handle() };
     if (checking()) return;
     cx.timer.every(LAYOUT_CHECK_MS, () => this.closeWhenColumnMoved());
+    this.focusAtOpen = focusKey();
+    cx.timer.every(FOCUS_CHECK_MS, () => this.closeWhenFocusMoved());
     // Shown copies of this mod all hear its commands: the scheduler opens the screen, the screen
     // follows a toast's run and closes on `benni-routines.close`.
     cx.spawn(async (cx) => {
@@ -134,6 +141,11 @@ export class RoutinesScreen {
     const now = workColumnBounds();
     if (!viewport) return;
     if (now.viewport.width !== viewport.width || now.viewport.height !== viewport.height || Math.round(now.x) !== Math.round(x)) this.close();
+  }
+
+  // A session picked in the sidebar (another space, tab or pane) is shown at once, screen closed.
+  closeWhenFocusMoved() {
+    if (this.focusAtOpen !== null && focusKey() !== this.focusAtOpen) this.close();
   }
 
   onKey(event, cx) {
