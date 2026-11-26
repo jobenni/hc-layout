@@ -64,6 +64,10 @@ function authHeader(on, cwd) {
 }
 
 const segment = (name) => encodeURIComponent(name);
+const DESCRIPTION_LIMIT = 4000;
+// "2026-11-26T10:49:22.5416538Z ##[error]..." -> "##[error]..."
+const buildLogText = (line) => line.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, "").replace(/\x1b\[[0-9;]*m/g, "");
+const buildIds = (checks) => [...new Set(checks.map((c) => /[?&]buildId=(\d+)/.exec(c.url ?? "")?.[1]).filter(Boolean))];
 const wiqlString = (text) => `'${text.replace(/'/g, "''")}'`;
 
 function checkName(policy) {
@@ -174,8 +178,24 @@ export function azureDevOpsForge({ org, project, repo }, repoPath, on) {
     };
   }
 
+  async function readFailedBuildLogs(buildId, lineCount) {
+    const buildApi = `${projectUrl}/_apis/build/builds/${buildId}`;
+    const [timeline, logList] = await Promise.all([request(`${buildApi}/timeline?${API}`), request(`${buildApi}/logs?${API}`)]);
+    const lineCounts = new Map(logList.value.map((log) => [log.id, log.lineCount ?? 0]));
+    const failedSteps = timeline.records.filter((r) => r.type === "Task" && r.result === "failed" && r.log?.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const logs = [];
+    for (const step of failedSteps) {
+      const startLine = Math.max(1, (lineCounts.get(step.log.id) ?? 0) - lineCount + 1);
+      const log = await request(`${buildApi}/logs/${step.log.id}?startLine=${startLine}&${API}`).catch(() => ({ value: [] }));
+      const lines = log.value.map(buildLogText).filter((l) => l.trim());
+      if (lines.length) logs.push(`${step.name}\n${lines.slice(-lineCount).join("\n")}`);
+    }
+    return logs;
+  }
+
   return {
     name: "Azure DevOps",
+    readPullRequest: readPullRequestOf,
     hasSingleAssignee: true,
     workPrompt: (issue) => `Traite le work item Azure DevOps ${issue.url}`,
 
@@ -201,6 +221,32 @@ export function azureDevOpsForge({ org, project, repo }, repoPath, on) {
       const unique = [...new Set(branches.filter(Boolean))];
       const found = await Promise.all(unique.map((branch) => readPullRequestOf(branch).catch(() => null)));
       return new Map(unique.map((branch, index) => [branch, found[index]]).filter(([, pr]) => pr));
+    },
+
+    async readIssue(number) {
+      const item = await request(`${projectUrl}/_apis/wit/workitems/${number}?fields=System.Title&${API}`);
+      return { title: item.fields["System.Title"], url: `${projectUrl}/_workitems/edit/${item.id}` };
+    },
+
+    // Into the repo's default branch, linked to the work item (the board shows it, completion can close it).
+    async createPullRequest({ branch, title, issueNumber, commits }) {
+      const { defaultBranch } = await request(`${repoApi}?${API}`);
+      await request(`${repoApi}/pullrequests?${API}`, {
+        method: "POST",
+        body: {
+          sourceRefName: `refs/heads/${branch}`,
+          targetRefName: defaultBranch,
+          title,
+          description: (commits ?? "").slice(0, DESCRIPTION_LIMIT),
+          workItemRefs: issueNumber ? [{ id: String(issueNumber) }] : [],
+        },
+      });
+    },
+
+    // The last lines of each failed build's failed steps.
+    async readFailedCheckLogs(failedChecks, lineCount) {
+      const logs = await Promise.all(buildIds(failedChecks).map((id) => readFailedBuildLogs(id, lineCount).catch(() => [])));
+      return logs.flat();
     },
 
     async readViewer() {

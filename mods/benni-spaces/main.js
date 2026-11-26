@@ -7,6 +7,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
 import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, notify, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, checking, updates } from "herdr";
 import { machineKey } from "./machine-files.js";
+import { forgeOf, checksSummary } from "./forge.js";
 import { DEFAULT_WORKSPACE, readWorkspaces, workspaceOfSpace, changeWorkspaces, syncWorkspaces } from "./workspaces-store.js";
 
 // The layout's update check, repeated in benni-spaces and benni-settings (Herdr refuses imports between mods).
@@ -144,14 +145,11 @@ async function runGit(args, cwd, on) {
 // the next step as a button (open the PR, hand the failing CI to the agent, clean up once merged).
 const PR_TTL = 30000;
 const PR_TTL_IN_BACKGROUND = 120000;
-const PR_FIELDS = "number,title,url,state,isDraft,headRefOid,statusCheckRollup";
 const TRUNK_BRANCHES = new Set(["main", "master", "(detached)"]);
 // On these, work goes straight to the remote: commit and push instead of a PR.
 const PUSHED_DIRECTLY_BRANCHES = new Set(["main", "master"]);
 // A step's state lives with the PR on a branch of its own, else with the session's folder.
 const stepKey = (session) => session.prKey ?? session.key;
-const FAILED_CHECK_VERDICTS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
-const PENDING_CHECK_VERDICTS = new Set(["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"]);
 const CI_LOG_LINES_PER_RUN = 80;
 const CLEAN_CONFIRM_MS = 4000;
 // hc send pauses about a second before pasting; longer means it holds for a draft typed in the session.
@@ -159,25 +157,8 @@ const DRAFT_HOLD_HINT_MS = 2000;
 const SPACE_CLOSE_WAIT = 10000;
 const ICONS = "mods/gh-issues/icons";
 
-function failedChecksOf(pr) {
-  return (pr?.statusCheckRollup ?? []).flatMap((check) => {
-    const isStatusContext = check.__typename === "StatusContext";
-    const verdict = isStatusContext ? check.state : check.status === "COMPLETED" ? check.conclusion : check.status;
-    if (!FAILED_CHECK_VERDICTS.has(verdict)) return [];
-    return [{ name: isStatusContext ? check.context : check.workflowName ? `${check.workflowName} · ${check.name}` : check.name, url: isStatusContext ? check.targetUrl : check.detailsUrl }];
-  });
-}
-
-function checksOutcome(pr) {
-  const checks = pr?.statusCheckRollup ?? [];
-  if (!checks.length) return "none";
-  if (failedChecksOf(pr).length) return "failure";
-  const isPending = (check) => {
-    const verdict = check.__typename === "StatusContext" ? check.state : check.status === "COMPLETED" ? check.conclusion : check.status;
-    return !verdict || PENDING_CHECK_VERDICTS.has(verdict);
-  };
-  return checks.some(isPending) ? "pending" : "success";
-}
+const failedChecksOf = (pr) => (pr?.checks ?? []).filter((check) => check.outcome === "failure");
+const checksOutcome = (pr) => checksSummary(pr?.checks ?? []);
 
 function pullRequestLook(pr, t) {
   if (pr.state === "MERGED") return { icon: `${ICONS}/pr-merged.svg`, color: t.ansi5, label: "fusionnée" };
@@ -192,9 +173,6 @@ const CHECKS_LOOK = {
   pending: { glyph: "●", label: "CI en cours", tone: "working" },
 };
 
-// "build\tRun tests\t2026-11-25T10:00:00.1234567Z error: ..." -> "error: ..."
-const ciLogText = (line) => line.split("\t").slice(2).join("\t").replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, "").replace(/\x1b\[[0-9;]*m/g, "");
-const actionsRunIds = (checks) => [...new Set(checks.map((c) => /\/actions\/runs\/(\d+)/.exec(c.url ?? "")?.[1]).filter(Boolean))];
 const isInside = (folder, root) => Boolean(folder) && (folder === root || folder.startsWith(`${root}/`));
 // The app's own opener on macOS and Windows; under Linux it may run inside WSL, where
 // xdg-open has nothing to hand the URL to, so Windows' browser gets it instead.
@@ -329,9 +307,10 @@ export default class Spaces extends View {
     this.watching = new Map(); // local repos' pending folder watches
     this.bots = {}; // where() of a Claude session -> its folder holds bot.json
     this.botChecked = {}; // where() -> when bot.json was last looked for
-    this.issues = {}; // where() + "#" + number -> { title, url }, or null when gh couldn't say
+    this.issues = {}; // where() + "#" + number -> { title, url, tracker }, or null when the tracker couldn't say
+    this.forges = {}; // [machine, main checkout] -> its tracker (GitHub or Azure DevOps), as a promise
     this.sessionGit = {}; // [machine, folder] of a working session -> { name, branch, linked, at }
-    this.pullRequests = {}; // pullRequestKey() -> { pr: the branch's PR or null, at, loading }
+    this.pullRequests = {}; // pullRequestKey() -> { pr: the branch's PR or null, tracker, at, loading }
     this.lifecycle = {}; // pullRequestKey() -> { busy: the running step's label, error, sentForHead, confirmCleanUntil }
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
@@ -855,13 +834,22 @@ export default class Spaces extends View {
       if (!issueKey || !main || issueKey in this.issues) continue;
       this.issues[issueKey] = null;
       cx.spawn(async (cx) => {
-        const r = await exec("sh", ["-c", WITH_FOLDER_ENV, "sh", "gh", "api", `repos/{owner}/{repo}/issues/${issue}`, "--jq", "{title, url: .html_url}"], { cwd: main, on: machine, timeout: 30000 });
-        try { if (r.code === 0) this.issues[issueKey] = JSON.parse(r.stdout); } catch {}
+        try {
+          const forge = await this.forgeFor(machine, main);
+          this.issues[issueKey] = { ...await forge.readIssue(issue), tracker: forge.name };
+        } catch {}
         cx.notify();
       });
     }
     for (const k of Object.keys(this.sessionGit)) if (!keys.has(k)) delete this.sessionGit[k];
     for (const k of Object.keys(this.pullRequests)) if (!prKeys.has(k)) delete this.pullRequests[k];
+  }
+
+  // A failed detection is not kept: the next look tries again.
+  forgeFor(machine, main) {
+    const key = JSON.stringify([machine, main]);
+    if (!this.forges[key]) this.forges[key] = forgeOf(main, machine).catch((error) => { delete this.forges[key]; throw error; });
+    return this.forges[key];
   }
 
   // [machine, main checkout, branch] of a session on a branch of its own, once its git is read.
@@ -883,9 +871,10 @@ export default class Spaces extends View {
     const [machine, main, branch] = JSON.parse(prKey);
     const before = this.pullRequests[prKey];
     try {
-      const json = await runWithFolderEnv(["gh", "pr", "list", "--state", "all", "--head", branch, "--limit", "1", "--json", PR_FIELDS], main, machine, 30000);
-      const pr = JSON.parse(json)[0] ?? null;
-      this.pullRequests[prKey] = { ...before, pr, answered: true, at: Date.now(), loading: false };
+      const forge = await this.forgeFor(machine, main);
+      const found = await forge.readPullRequest(branch);
+      const pr = found ? { ...found, tracker: forge.name } : null;
+      this.pullRequests[prKey] = { ...before, pr, tracker: forge.name, answered: true, at: Date.now(), loading: false };
       if (before?.at && a) this.announcePullRequestChange(before.pr, pr, a);
     } catch {
       this.pullRequests[prKey] = { ...before, at: Date.now(), loading: false };
@@ -962,7 +951,7 @@ export default class Spaces extends View {
     }, cx);
   }
 
-  // Pushes the branch and opens its PR: the ticket's title (else the last commit's), "Closes #N", the commits.
+  // Pushes the branch and opens its PR: the ticket's title (else the last commit's), linked to the ticket, the commits.
   openPullRequest(prKey, session, ticket, cx) {
     const [machine, main, branch] = JSON.parse(prKey);
     this.runLifecycleStep(prKey, "Ouverture…", async (cx) => {
@@ -970,8 +959,8 @@ export default class Spaces extends View {
       const lastSubject = (await runGit(["log", "-1", "--format=%s", branch], main, machine)).out;
       const commits = (await runGit(["log", "--reverse", "--format=- %s", `origin/HEAD..${branch}`], main, machine)).out;
       const title = ticket?.title || lastSubject || branch;
-      const body = [session.issue ? `Closes #${session.issue}` : null, commits].filter(Boolean).join("\n\n");
-      await runWithFolderEnv(["gh", "pr", "create", "--head", branch, "--title", title, "--body", body], main, machine);
+      const forge = await this.forgeFor(machine, main);
+      await forge.createPullRequest({ branch, title, issueNumber: session.issue, commits });
       await this.readPullRequest(prKey, null, cx);
     }, cx);
   }
@@ -981,12 +970,8 @@ export default class Spaces extends View {
     const [machine, main] = JSON.parse(prKey);
     this.runLifecycleStep(prKey, "Lecture des logs…", async (cx) => {
       const failed = failedChecksOf(pr);
-      const logs = [];
-      for (const runId of actionsRunIds(failed)) {
-        const out = await runWithFolderEnv(["gh", "run", "view", runId, "--log-failed"], main, machine).catch(() => "");
-        const lines = out.split("\n").map(ciLogText).filter((l) => l.trim());
-        if (lines.length) logs.push(lines.slice(-CI_LOG_LINES_PER_RUN).join("\n"));
-      }
+      const forge = await this.forgeFor(machine, main);
+      const logs = await forge.readFailedCheckLogs(failed, CI_LOG_LINES_PER_RUN).catch(() => []);
       const checkList = failed.map((c) => `- ${c.name}${c.url ? ` : ${c.url}` : ""}`).join("\n");
       const message = [
         `La CI de la PR #${pr.number} échoue. Trouve la cause, corrige, commite et pousse sur cette branche.`,
@@ -1091,7 +1076,7 @@ export default class Spaces extends View {
         .child(this.agentStatus(t, a.status)))
       .when(Boolean(reason) && reason !== a.sessionName, (el) => el.child(div().pl(detailIndent).truncate().text_size(11.5).text_color(tint).child(reason)))
       .when(Boolean(issue), (el) => el.child(h_flex().id(`card-issue-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
-        .when(Boolean(ticket?.url), (row) => row.tooltip("Ouvrir le ticket sur GitHub")
+        .when(Boolean(ticket?.url), (row) => row.tooltip(`Ouvrir le ticket sur ${ticket.tracker ?? "GitHub"}`)
           .on_click((_e, cx) => { cx.stop_propagation(); openUrl(ticket.url, cx); }))
         .child(svg("mods/gh-issues/icons/issue.svg").size(12).flex_none().text_color(t.ansi2))
         .child(div().flex_none().font_semibold().text_color(t.ansi2).child(`#${issue}`))
@@ -1112,7 +1097,7 @@ export default class Spaces extends View {
     const look = pullRequestLook(pr, t);
     const checks = pr.state === "OPEN" ? CHECKS_LOOK[checksOutcome(pr)] : null;
     return h_flex().id(`card-pr-${a.address}`).pl(detailIndent).gap(5).items_center().text_size(11.5)
-      .tooltip("Ouvrir la PR sur GitHub")
+      .tooltip(`Ouvrir la PR sur ${pr.tracker ?? "GitHub"}`)
       .on_click((_e, cx) => { cx.stop_propagation(); openUrl(pr.url, cx); })
       .child(svg(look.icon).size(12).flex_none().text_color(look.color))
       .child(div().flex_none().font_semibold().text_color(look.color).child(`#${pr.number}`))
@@ -1151,7 +1136,7 @@ export default class Spaces extends View {
     const known = prKey ? this.pullRequests[prKey] : null;
     if (!known?.answered) return null;
     if (!pr && sg?.commitsAhead > 0) {
-      return button("open-pr", "Ouvrir la PR", t.accent, `Pousse ${sg.branch} et ouvre sa PR${session.issue ? ` (Closes #${session.issue})` : ""}`,
+      return button("open-pr", "Ouvrir la PR", t.accent, `Pousse ${sg.branch} et ouvre sa PR${!session.issue ? "" : known.tracker === "Azure DevOps" ? `, liée au work item #${session.issue}` : ` (Closes #${session.issue})`}`,
         (cx) => this.openPullRequest(prKey, session, ticket, cx));
     }
     if (pr?.state === "OPEN" && checksOutcome(pr) === "failure") {

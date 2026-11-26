@@ -32,6 +32,10 @@ function checkOutcome(verdict) {
 
 const toAssignee = (user) => ({ id: user.login, name: user.login });
 
+// "build\tRun tests\t2026-11-25T10:00:00.1234567Z error: ..." -> "error: ..."
+const ciLogText = (line) => line.split("\t").slice(2).join("\t").replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, "").replace(/\x1b\[[0-9;]*m/g, "");
+const actionsRunIds = (checks) => [...new Set(checks.map((c) => /\/actions\/runs\/(\d+)/.exec(c.url ?? "")?.[1]).filter(Boolean))];
+
 export function gitHubForge(repoPath, on) {
   async function readPullRequestOf(branch) {
     const pr = JSON.parse(await runGh(["pr", "list", "--state", "all", "--head", branch, "--limit", "1", "--json", PR_FIELDS], repoPath, on))[0];
@@ -42,6 +46,7 @@ export function gitHubForge(repoPath, on) {
 
   return {
     name: "GitHub",
+    readPullRequest: readPullRequestOf,
     hasSingleAssignee: false,
     workPrompt: (issue) => `Traite l'issue ${issue.url}`,
 
@@ -54,6 +59,26 @@ export function gitHubForge(repoPath, on) {
       const unique = [...new Set(branches.filter(Boolean))];
       const found = await Promise.all(unique.map((branch) => readPullRequestOf(branch).catch(() => null)));
       return new Map(unique.map((branch, index) => [branch, found[index]]).filter(([, pr]) => pr));
+    },
+
+    async readIssue(number) {
+      return JSON.parse(await runGh(["api", `repos/{owner}/{repo}/issues/${number}`, "--jq", "{title, url: .html_url}"], repoPath, on));
+    },
+
+    async createPullRequest({ branch, title, issueNumber, commits }) {
+      const body = [issueNumber ? `Closes #${issueNumber}` : null, commits].filter(Boolean).join("\n\n");
+      await runGh(["pr", "create", "--head", branch, "--title", title, "--body", body], repoPath, on);
+    },
+
+    // The last lines of each failed Actions run's failed steps.
+    async readFailedCheckLogs(failedChecks, lineCount) {
+      const logs = [];
+      for (const runId of actionsRunIds(failedChecks)) {
+        const out = await runGh(["run", "view", runId, "--log-failed"], repoPath, on).catch(() => "");
+        const lines = out.split("\n").map(ciLogText).filter((l) => l.trim());
+        if (lines.length) logs.push(lines.slice(-lineCount).join("\n"));
+      }
+      return logs;
     },
 
     async readViewer() {
