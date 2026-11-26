@@ -25,6 +25,7 @@ const LIST_WIDTH = 340;
 const LAYOUT_CHECK_MS = 1000;
 const FOCUS_CHECK_MS = 150;
 const STATUS_LABEL = { running: "En cours", done: "Terminé", failed: "Échec", missed: "Manqué" };
+const EDITOR_TABS = [{ id: "general", label: "Général" }, { id: "schedule", label: "Planification" }, { id: "options", label: "Options" }];
 
 const effortColor = (t, effort) => ({ low: t.ansi4, medium: t.ansi6, high: t.ansi2, xhigh: t.ansi3, max: t.ansi1 }[effort] ?? t.dim);
 const statusColor = (t, status) => ({ running: t.working, done: t.ansi2, failed: t.ansi1, missed: t.dim }[status] ?? t.dim);
@@ -170,7 +171,7 @@ export class RoutinesScreen {
   startEditing(routine, cx) {
     if (!this.reach().writable) return;
     const draft = routine ? JSON.parse(JSON.stringify(routine)) : blankRoutine();
-    this.editing = { draft, isNew: !routine };
+    this.editing = { draft, isNew: !routine, tab: "general" };
     this.formError = "";
     this.confirmingRoutineDelete = false;
     this.nameInput.set_value(draft.name);
@@ -251,7 +252,11 @@ export class RoutinesScreen {
       : !routine.prompt ? "Écris le prompt."
       : !routine.folder ? "Choisis un répertoire."
       : scheduleError(routine.schedule) ? `Planification : ${scheduleError(routine.schedule)}.` : "";
-    if (problem) { this.formError = problem; cx.notify(); return; }
+    if (problem) {
+      this.formError = problem;
+      if (scheduleError(routine.schedule)) this.editing.tab = "schedule";
+      cx.notify(); return;
+    }
     const machine = this.machine;
     cx.spawn(async (cx) => {
       // The folder is on the routine's machine: checked there.
@@ -766,6 +771,17 @@ export class RoutinesScreen {
   }
 
 
+  editorTabs(t) {
+    return h_flex().flex_none().px(20).gap(18).border_b_1().border_color(t.border).children(EDITOR_TABS.map((tab) => {
+      const on = tab.id === this.editing.tab;
+      return div().id(`editor-tab-${tab.id}`).h(32).flex_none().flex().items_center().border_b_2().border_color(on ? t.accent : t.accent + "00")
+        .text_size(12.5).when(on, (el) => el.font_medium()).text_color(on ? t.foreground : t.muted).cursor_pointer()
+        .hover((s) => s.text_color(t.foreground))
+        .on_click((_e, cx) => { this.editing.tab = tab.id; cx.notify(); })
+        .child(tab.label);
+    }));
+  }
+
   editor(t) {
     const { draft, isNew } = this.editing;
     return this.card("routine-editor").flex_1().min_w(0)
@@ -775,28 +791,31 @@ export class RoutinesScreen {
           .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Annuler")
           .on_click((_e, cx) => { this.editing = null; this.handle.focus(); cx.notify(); })
           .child(svg(CLOSE).size(12))))
-      .child(v_flex().id("editor-body").flex_1().min_h(0).overflow_y_scrollbar().px(20).pb(16).gap(16)
-        .child(h_flex().gap(12)
-          .child(div().flex_1().child(this.field("Nom", h_flex().child(this.input(this.nameInput, t)))))
-          .child(div().flex_1().child(this.field("Description", h_flex().child(this.input(this.descriptionInput, t))))))
-        .child(this.field("Prompt", Textarea.new(this.promptInput).w_full().px(10).py(8).rounded(7).border_1().border_color(t.input)
-          .bg(t.background).text_size(12.5).text_color(t.foreground)))
-        .child(this.field("Planification", this.scheduleEditor(t)))
-        .child(this.field(this.machine ? `Répertoire sur ${this.machine}` : "Répertoire", h_flex().gap(6).child(this.input(this.folderInput, t))
-          // The system's folder picker only sees this computer: another machine's folder is typed, then checked there.
-          .when(!this.machine, (el) => el.child(this.textButton("editor-pick-folder", "Choisir…", "plain", (cx) => this.chooseFolder(cx)))),
-          draft.worktree ? "Chaque run part d'un nouveau worktree de ce dépôt, sur une branche routine-…" : "La session tourne dans ce répertoire tel quel."))
-        .child(h_flex().gap(24).items_start()
-          .child(this.field("Modèle", this.modelSelect(t, draft)))
-          .child(this.field("Effort", this.effortPicker(t), "« Défaut » laisse --effort de côté.")))
-        .child(this.field("Options", v_flex().gap(10)
-          .child(this.optionRow("editor-worktree", "Worktree", "Un nouveau worktree par run, basé sur origin/HEAD.", draft.worktree, () => { draft.worktree = !draft.worktree; }))
-          .child(this.optionRow("editor-print", "Mode -p", "claude -p : non interactif, cet écran lit sa sortie ; « Ouvrir » reprend la conversation.", draft.print, () => { draft.print = !draft.print; }))
-          .child(this.optionRow("editor-toast", "Toast à la fin", "Une notification Herdr quand le run se termine ou échoue.", draft.toast, () => { draft.toast = !draft.toast; }))
-          .child(this.optionRow("editor-push", "Push Claude",
-            draft.print ? "Nécessite le mode interactif (Remote Control)." : "Lance Claude avec Remote Control et lui demande un push de résumé sur le téléphone à la fin.",
-            draft.push && !draft.print, () => { draft.push = !draft.push; }, draft.print))))
-        .child(this.field("Runs gardés", h_flex().child(this.input(this.keepInput, t, 70)), "Au-delà, le plus ancien est purgé : onglet fermé, entrée retirée, worktree nettoyé s'il est propre."))
+      .child(this.editorTabs(t))
+      .child(v_flex().id("editor-body").flex_1().min_h(0).overflow_y_scrollbar().px(20).py(16).gap(16)
+        .when(this.editing.tab === "general", (el) => el
+          .child(h_flex().gap(12)
+            .child(div().flex_1().child(this.field("Nom", h_flex().child(this.input(this.nameInput, t)))))
+            .child(div().flex_1().child(this.field("Description", h_flex().child(this.input(this.descriptionInput, t))))))
+          .child(this.field("Prompt", Textarea.new(this.promptInput).w_full().px(10).py(8).rounded(7).border_1().border_color(t.input)
+            .bg(t.background).text_size(12.5).text_color(t.foreground)))
+          .child(this.field(this.machine ? `Répertoire sur ${this.machine}` : "Répertoire", h_flex().gap(6).child(this.input(this.folderInput, t))
+            // The system's folder picker only sees this computer: another machine's folder is typed, then checked there.
+            .when(!this.machine, (el) => el.child(this.textButton("editor-pick-folder", "Choisir…", "plain", (cx) => this.chooseFolder(cx)))),
+            draft.worktree ? "Chaque run part d'un nouveau worktree de ce dépôt, sur une branche routine-…" : "La session tourne dans ce répertoire tel quel."))
+          .child(h_flex().gap(24).items_start()
+            .child(this.field("Modèle", this.modelSelect(t, draft)))
+            .child(this.field("Effort", this.effortPicker(t), "« Défaut » laisse --effort de côté."))))
+        .when(this.editing.tab === "schedule", (el) => el.child(this.field("Planification", this.scheduleEditor(t))))
+        .when(this.editing.tab === "options", (el) => el
+          .child(this.field("Options", v_flex().gap(10)
+            .child(this.optionRow("editor-worktree", "Worktree", "Un nouveau worktree par run, basé sur origin/HEAD.", draft.worktree, () => { draft.worktree = !draft.worktree; }))
+            .child(this.optionRow("editor-print", "Mode -p", "claude -p : non interactif, cet écran lit sa sortie ; « Ouvrir » reprend la conversation.", draft.print, () => { draft.print = !draft.print; }))
+            .child(this.optionRow("editor-toast", "Toast à la fin", "Une notification Herdr quand le run se termine ou échoue.", draft.toast, () => { draft.toast = !draft.toast; }))
+            .child(this.optionRow("editor-push", "Push Claude",
+              draft.print ? "Nécessite le mode interactif (Remote Control)." : "Lance Claude avec Remote Control et lui demande un push de résumé sur le téléphone à la fin.",
+              draft.push && !draft.print, () => { draft.push = !draft.push; }, draft.print))))
+          .child(this.field("Runs gardés", h_flex().child(this.input(this.keepInput, t, 70)), "Au-delà, le plus ancien est purgé : onglet fermé, entrée retirée, worktree nettoyé s'il est propre.")))
         .when(Boolean(this.formError), (el) => el.child(div().text_size(12).text_color(t.ansi1).child(this.formError)))
         .child(this.confirmingRoutineDelete
           ? v_flex().p(8).gap(6).rounded(6).border_1().border_color(t.ansi1 + "55").text_size(12)
