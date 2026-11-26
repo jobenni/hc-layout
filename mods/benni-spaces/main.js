@@ -673,7 +673,7 @@ export default class Spaces extends View {
     const list = v_flex().id(`routines-list-${key}`).flex_none().gap(1)
       .when(maxHeight !== null, (el) => el.max_h(maxHeight).overflow_y_scrollbar())
       .children(rows);
-    return v_flex().id(`routines-${key}`).flex_none().pb(4)
+    return v_flex().id(`routines-${key}`).flex_none().pb(12)
       .child(h_flex().id(`routines-title-${key}`).h(24).flex_none().px(8).gap(6).items_center().rounded(6)
         .text_size(11).font_medium().text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
         .tooltip(`Ouvrir les routines de ${machine ?? "cet ordinateur"}`)
