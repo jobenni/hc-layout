@@ -52,6 +52,7 @@ export default class Tabs extends View {
     const stop = (_e, cx) => cx.stop_propagation();
     const update = shared("benni.update"); // written by benni-spaces and benni-settings: { installed, latest }
     const updateAvailable = !!(update?.installed && update.latest && update.installed !== update.latest);
+    const runningRoutines = (shared("benni.routines")?.runs ?? []).filter(r => r.status === "running").length; // written by benni-routines
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const item = (c, i) => {
@@ -100,6 +101,11 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
       .child(panelButton("graph", "Graph", "mods/git-graph/icons/graph.svg"))
       .child(panelButton("issues", "Issues", "mods/gh-issues/icons/issue.svg"))
+      .child(h_flex().id("routines").h(26).px(8).gap(5).flex_none().items_center().rounded(6).text_size(12).bg(t.chrome).text_color(t.muted)
+        .hover(s => s.bg(t.hover)).on_mouse_down("left", stop).tooltip(runningRoutines ? `Routines · ${runningRoutines} en cours` : "Routines")
+        .on_click(() => run("benni-routines.open"))
+        .child(runningRoutines ? svg("mods/workspace-chrome/spinner.svg").size(14).text_color(t.working).spin(900) : svg("mods/workspace-chrome/clock.svg").size(14))
+        .child("Routines"))
       .child(button("settings", svg("mods/workspace-chrome/settings.svg").size(14), () => openOverlay({ mod: "benni-settings", kind: "dialog", width: 680, height: 460 }))
         .relative().tooltip(updateAvailable ? "Réglages · mise à jour disponible" : "Réglages")
         .when(updateAvailable, el => el.child(div().absolute().top(4).right(4).size(7).rounded(4).bg(t.accent).border(1).border_color(t.chrome))))

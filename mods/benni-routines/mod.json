@@ -1,0 +1,7 @@
+{
+  "place": "none",
+  "title": "Routines",
+  "palette": [
+    { "title": "Routines", "command": "benni-routines.open", "words": "routine planning cron claude" }
+  ]
+}

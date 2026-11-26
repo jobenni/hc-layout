@@ -76,6 +76,8 @@ const sessionIndent = (tree) => (tree ? NESTED_SESSION_INDENT : SESSION_INDENT);
 // A space's name and its git tail never shrink below this, so a short one ("api")
 // stays readable instead of turning into an ellipsis next to a long branch.
 const SIDE_MIN = 48;
+const routinesMark = (size, t) => h_flex().size(size).flex_none().rounded(5).bg(t.raised).items_center().justify_center()
+  .child(svg("mods/workspace-chrome/clock.svg").size(size * 0.67).text_color(t.muted));
 const railCell = (el) => h_flex().flex_none().justify_center().child(el);
 const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
 const base = (path) => path.replace(/\/+$/, "").split("/").pop();
@@ -94,6 +96,10 @@ const CARDED_STATUSES = ["blocked", "working"];
 // Sessions at rest stay carded this long after their last change.
 const RESTING_STATUSES = ["done", "idle"];
 const RESTING_CARD_TTL = 86400000;
+// The space benni-routines runs its routines in: last in the list, folded once when it appears,
+// a clock instead of an avatar, and kept out of "En cours" and "Au repos" (a blocked routine still needs you).
+const routinesSpaceId = () => shared("benni.routines")?.spaceId ?? null;
+const isRoutineSession = (a) => Boolean(a.space) && a.space === routinesSpaceId();
 // gh (and git pushing through gh's credentials) answers as the folder's account only through its mise env (GH_TOKEN).
 const WITH_FOLDER_ENV = 'command -v mise >/dev/null 2>&1 && exec mise exec -- "$@"; exec "$@"';
 
@@ -441,6 +447,14 @@ export default class Spaces extends View {
     return [key, ...(repo ? [...keys].filter((k) => this.git[k]?.repo === repo) : [])];
   }
 
+  foldRoutinesSpaceOnce() {
+    const id = routinesSpaceId();
+    if (!id || localStorage.getItem("routines.folded") === id || !spaces().some((s) => s.id === id)) return;
+    localStorage.setItem("routines.folded", id);
+    this.foldedSpaces.add(id);
+    this.saveFoldedSpaces();
+  }
+
   saveFoldedSpaces() {
     const ids = new Set(spaces().map((s) => s.id));
     for (const id of this.foldedSpaces) if (!ids.has(id)) this.foldedSpaces.delete(id);
@@ -679,7 +693,7 @@ export default class Spaces extends View {
 
   // A carded session's own folder (often a worktree its space doesn't point at): its git, then its ticket.
   lookAtCardedSessions(now, sp, ps, cx) {
-    const carded = agents().filter((a) => CARDED_STATUSES.includes(a.status) || this.restedRecently(a, now));
+    const carded = agents().filter((a) => a.status === "blocked" || ((CARDED_STATUSES.includes(a.status) || this.restedRecently(a, now)) && !isRoutineSession(a)));
     const keys = new Set();
     const prKeys = new Set();
     for (const a of carded) {
@@ -909,6 +923,7 @@ export default class Spaces extends View {
   }
 
   spaceMark(spaceId, name, size) {
+    if (spaceId === routinesSpaceId()) return routinesMark(size, theme());
     const color = (shared("space.colors") ?? {})[spaceId] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? theme()[color]);
     return h_flex().size(size).flex_none().rounded(4).bg(fill).items_center().justify_center()
@@ -1231,6 +1246,9 @@ export default class Spaces extends View {
       const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
       kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
     }
+    const routinesAt = out.findIndex((r) => r.w.id === routinesSpaceId());
+    if (routinesAt >= 0 && !out[routinesAt].tree) out.push(...out.splice(routinesAt, 1));
+    this.foldRoutinesSpaceOnce();
     // Simulate the batch so later indexes include earlier moves. An attempted
     // write can lose a sync conflict: allow the echo to settle before retrying.
     const order = sp.map(w => w.id);
@@ -1489,7 +1507,8 @@ export default class Spaces extends View {
           .gap(tree ? SESSION_GAP : 9)
           .items_center()
           .when(Boolean(tree), el => el.pl(WORKTREE_ICON_INDENT).child(h_flex().size(SESSION_ICON).flex_none().items_center().justify_center().child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim))))
-          .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
+          .when(!tree && w.id === routinesSpaceId(), el => el.child(routinesMark(18, t)))
+          .when(!tree && w.id !== routinesSpaceId(), el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_initial().min_w(SIDE_MIN).truncate().text_color(t.foreground).child(w.name))
           .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1())
           .when(folded && sessions.length > 0, (el) => el.child(this.sessionCounters(w, sessions, t)))
@@ -1551,9 +1570,9 @@ export default class Spaces extends View {
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
     const blocked = this.agentsWithStatus("blocked");
-    const working = this.agentsWithStatus("working");
+    const working = this.agentsWithStatus("working").filter((a) => !isRoutineSession(a));
     const now = Date.now();
-    const resting = this.agentsWithStatus(...RESTING_STATUSES).filter((a) => this.restedRecently(a, now));
+    const resting = this.agentsWithStatus(...RESTING_STATUSES).filter((a) => this.restedRecently(a, now) && !isRoutineSession(a));
     const railSessions = collapsed ? this.railSessions([["Needs you", blocked], ["En cours", working], ["Au repos", resting]], t) : null;
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
       .when(Boolean(railSessions), (el) => el.child(railSessions))
